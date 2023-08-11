@@ -1,6 +1,6 @@
 test*
-./data/*.npy
-
+data/*.npy
+model
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
