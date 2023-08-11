@@ -18,7 +18,7 @@
 ;
 
 ; Include forcefield parameters
-#include "./charmm36-mar2019.ff/forcefield.itp"
+#include "/home/gridsan/ywang3/Project/rid_openmm/rid/charmm36-mar2019.ff/forcefield.itp"
 
 [ moleculetype ]
 ; Name            nrexcl
@@ -1606,7 +1606,7 @@ Protein_chain_A     3
 #endif
 
 ; Include water topology
-#include "./charmm36-mar2019.ff/tip3p.itp"
+#include "/home/gridsan/ywang3/Project/rid_openmm/rid/charmm36-mar2019.ff/tip3p.itp"
 
 #ifdef POSRES_WATER
 ; Position restraint for each water oxygen
@@ -1616,7 +1616,7 @@ Protein_chain_A     3
 #endif
 
 ; Include topology for ions
-#include "./charmm36-mar2019.ff/ions.itp"
+#include "/home/gridsan/ywang3/Project/rid_openmm/rid/charmm36-mar2019.ff/ions.itp"
 
 [ system ]
 ; Name

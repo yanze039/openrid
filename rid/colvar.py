@@ -1,8 +1,8 @@
 import torch
 import numpy as np
-import MDAnalysis as mda
 from pathlib import Path
-from MDAnalysis.analysis.dihedrals import Dihedral
+# import MDAnalysis as mda
+# from MDAnalysis.analysis.dihedrals import Dihedral
 
 class DihedralAngle(torch.nn.Module):
 
@@ -36,33 +36,6 @@ class DihedralAngle(torch.nn.Module):
         # angle between v and w in a plane is the torsion angle
         x = (v*w).sum(-1)
         y = (torch.cross(v, w, dim=-1)* b1).sum(-1)
-        return torch.arctan2(y, x)
+        return torch.arctan2(y, x).requires_grad_(True)
 
-
-
-if __name__ == "__main__":
-    data = Path("../data/")
-    u = mda.Universe(data/"npt.gro")
-    dihedral_selection = []
-    for res in u.residues:
-        if res.resname == "SOL" or res.resname == "NA" or res.resname == "CL":
-            continue
-        if res.phi_selection() is None:
-            continue
-        else:
-            dihedral_selection.append([ii.index for ii in res.phi_selection()])
-    # help(u.residues[0])
-    ca = u.select_atoms('resid 1-10')
-    # print(ca.positions)
-    ags = [res.phi_selection() for res in u.residues[1:10]]
-    da = Dihedral(ags).run()
-    print("Dihedral angles from MDAnalysis:")
-    print(np.deg2rad(da.angles))
-    
-    dihedral_selection = np.array(dihedral_selection)
-    dih_positions = ca.positions[dihedral_selection.flatten()].reshape([-1, 4, 3])
-    mymodel = DihedralAngle()
-    dihedrals = mymodel(torch.from_numpy(dih_positions))
-    print("Dihedral angles from Model:")
-    print(dihedrals)
  
