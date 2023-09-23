@@ -1,0 +1,12 @@
+parmed 
+MDAnalysis 
+mdtraj
+mpi4py 
+mpich 
+mpi 
+clusterutils 
+openmmtools
+pytorch=2=*cuda*
+openmm-torch=1.1
+numpy
+scikit-learn
