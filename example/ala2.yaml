@@ -1,0 +1,60 @@
+option:
+  initial_conformers: ["/home/gridsan/ywang3/Project/rid_openmm/example/ala2/conf.gro"]
+  topology_file: "/home/gridsan/ywang3/Project/rid_openmm/example/ala2/topol.top"
+  task_name: test
+  num_rid_cycles: 20
+  temperature: 300
+  pressure: 1
+  initial_model: null
+  trust_lvl_1: 3
+  trust_lvl_2: 3.5
+  output_dir: /home/gridsan/ywang3/Project/rid_openmm/ala2_out4
+  initial_data: /home/gridsan/ywang3/Project/rid_openmm/ala2_out3/round_2/data/data.npy
+
+
+collective_variables:
+  # mode is either torsion or distance
+  mode: torsion
+  # torsion_indices: List[List[int]], a list of torsion indices w. shape [*, 4]
+  # starts with 0 !!!
+  cv_indices: [[4,  6,  8, 14], [6,  8, 14, 16]]
+
+
+exploration:
+  n_replicas: 2
+  n_remd_iters: 400
+  n_steps_per_iter: 600
+  time_step: 0.002
+  is_mts: True
+  time_step_nn: 0.004
+  checkpoint_interval: 1
+  temperature_ladder: [300, 350]
+
+selection:
+  # distance cutoff for clustering
+  cluster_threshold: 0.5
+  n_cluster_lower: 50
+  n_cluster_upper: 80
+  n_cluster_threshold: 10
+
+labeling:
+  n_steps: 50000
+  checkpoint_interval: 50
+  time_step: 0.002
+  kappa: 500
+
+Train:
+  n_models: 4
+  neurons: [48, 48, 48, 48]
+  resnet: true
+  batch_size: 16
+  epochs: 7000
+  init_lr: 0.0008
+  decay_steps: 120
+  decay_rate: 0.96
+  drop_out_rate: 0.1
+  use_mix: false
+  restart: false
+  
+
+    
