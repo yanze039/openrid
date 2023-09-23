@@ -31,6 +31,4 @@ python setup.py install
 
 Tested on Chignolin system (one V100 GPU card)
 
-![speed benchmark](benchmarks/speed_benchmark.png "Speed Benchmark")
-
-
+<img src="benchmarks/speed_benchmark.png" alt="speed benchmark" style="width:250px;height:200px;"/>
