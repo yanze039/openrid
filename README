@@ -24,3 +24,11 @@ If mamba doesn't work, change to `conda install/create`.
 ```
 python setup.py install
 ```
+
+## Speed Benchmarks
+
+Tested on Chignolin system (one V100 GPU card)
+
+![speed benchmark](benchmarks/speed_benchmark.png "Speed Benchmark")
+
+
