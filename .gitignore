@@ -1,5 +1,9 @@
 test*
 data/*.npy
+submit
+ala2*
+chi*
+random_test
 model
 # Byte-compiled / optimized / DLL files
 __pycache__/
