@@ -1,5 +1,7 @@
 # Openrid: Reinforced Dynamics Built from OpenMM & PyTorch
 
+**WARNING: Packages are still under development and not well tested. Please use with caution.**
+
 ## Features
 
 * Parallel tempering sampling for different walkers
