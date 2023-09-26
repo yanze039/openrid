@@ -20,7 +20,10 @@ class DataManager(object):
 
 class BaseDataset(Dataset):
     def __init__(self, data, device):
-        self.data = torch.from_numpy(data).float().to(device)
+        if isinstance(data, np.ndarray):
+            self.data = torch.from_numpy(data).float().to(device)
+        else:
+            self.data = (data).float().to(device)
 
     def __len__(self):
         return len(self.data)
@@ -32,7 +35,10 @@ class BaseDataset(Dataset):
 
 class MultiModelDataset(Dataset):
     def __init__(self, data, n_models=4):
-        self.data = torch.from_numpy(data).float()
+        if isinstance(data, np.ndarray):
+            self.data = torch.from_numpy(data).float()
+        else:
+            self.data = (data).float()
         self.n_models = n_models
         self.index_list = [
             torch.randperm(len(self.data)) for _ in range(n_models)
@@ -303,12 +309,14 @@ class DihedralBiasVmap(nn.Module):
         self.n_cvs = n_cvs
 
         self.layer_norm = nn.LayerNorm(2*n_cvs)
-        self.activation = nn.ReLU()
+        # self.activation = nn.ReLU()
+        self.activation = nn.Tanh()
+        # self.activation = nn.GELU()
+
         self.dropout = nn.Dropout(p=dropout_rate)
         # model_list = []
 
         self.Sequence = nn.Sequential(
-            self.layer_norm,
             MultiLinearLayer( n_models, 2 * n_cvs, features[0]),
             self.activation,
             self.dropout,
@@ -331,6 +339,7 @@ class DihedralBiasVmap(nn.Module):
         self.loss_fn = nn.MSELoss()
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.colvar_idx = self.colvar_idx.to(self.device)
+        self.boos_factor = 1.5
     
     def get_e0(self):
         return self.e0
@@ -370,7 +379,8 @@ class DihedralBiasVmap(nn.Module):
         model_forces = self.get_mean_force_from_torsion(torsion)
         return model_energy, model_forces
 
-    def forward(self, positions, boxvectors):
+    # def forward(self, positions, boxvectors):
+    def forward(self, positions):
         """The forward method returns the energy computed from positions.
 
             Parameters
@@ -384,17 +394,17 @@ class DihedralBiasVmap(nn.Module):
             The potential energy (in kJ/mol)
         """
         positions.requires_grad_(True)
-        boxsize = boxvectors.diag()
-        positions = positions - torch.floor(positions/boxsize)*boxsize  # remove PBC
+        # boxsize = boxvectors.diag()
+        # positions = positions - torch.floor(positions/boxsize)*boxsize  # remove PBC
         selected_positions = positions[self.colvar_idx.flatten()].reshape([-1, 4, 3])  # [N_CVs, 4, 3]
         cvs, dcvs_dx = calculate_dihedral_and_derivatives(selected_positions)  # [*, 4, 3]
-        
         cvs = cvs.reshape([1, 1, -1])
         energy = self.get_energy_from_torsion(cvs)  # [4, *]
         force_list = []
         for imodel in range(self.n_models):
-            # add `-` to `energy`
-            mean_forces = torch.autograd.grad([ - energy[imodel],], [cvs,], retain_graph=True)[0]
+            # add `-` to `energy`?
+            # mean_forces = torch.autograd.grad([ - energy[imodel],], [cvs,], retain_graph=True)[0]
+            mean_forces = torch.autograd.grad([  energy[imodel],], [cvs,], retain_graph=True)[0]
             assert mean_forces is not None
             force_list.append( mean_forces)
         mean_forces = torch.stack(force_list, dim=0)
@@ -404,7 +414,7 @@ class DihedralBiasVmap(nn.Module):
         forces = torch.zeros_like(positions, device=mean_forces.device).index_add_(
             0, self.colvar_idx.flatten(), (mean_forces.reshape(-1, 1, 1) * dcvs_dx.reshape(-1, 4, 3)).reshape(-1, 3)
         )
-        return (energy.mean() * sigma, forces * sigma)
+        return (energy.mean() * sigma * self.boos_factor, forces * sigma * self.boos_factor)
     
     def get_mean_force_from_torsion(self, torsion):
         torsion = torsion.reshape([1, -1, self.n_cvs]).requires_grad_(True)
@@ -721,10 +731,6 @@ if __name__ == "__main__":
     x = torch.randn(1, 1, 5).to(device)
     w_x = torch.matmul(x, w)
     w_x_2= torch.matmul(x.flatten(), w)
-    print(w_x.shape)
-    print(w_x_2.shape)
-    print(w_x)
-    print(w_x_2)
     exit(0)
 
     mymodel = DihedralBiasVmap(

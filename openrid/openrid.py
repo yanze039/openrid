@@ -194,7 +194,7 @@ class ReinforcedDynamicsLoop:
                     timestep=self.timestep, 
                     n_remd_iters=self.n_remd_iters,
                     n_steps_per_iter=self.n_steps_per_iter, 
-                    reporter=mmtools.multistate.MultiStateReporter, 
+                    reporter=self.reporter, 
                     reporter_name=self.reporter_name, 
                     checkpoint_interval=self.checkpoint_interval_exploration,
                     trust_lvl_1=self.trust_lvl_1, 
@@ -207,6 +207,7 @@ class ReinforcedDynamicsLoop:
                     analysis_particle_indices=self.cv_def,
                     resume=self.resume,
                 )
+        
         self.exploration_step.run()
 
     def run_selection(self):
@@ -242,8 +243,7 @@ class ReinforcedDynamicsLoop:
             info_interval=self.n_steps_labeling/10,
             output_dir=self.labeling_output_dir,
             label_data_file_name=self.label_data_file_name,
-            reset_box=True,
-            platform="CUDA", 
+            reset_box=True
         )
         self.labeling_step.run()
     
@@ -290,11 +290,13 @@ class ReinforcedDynamicsLoop:
         
 
 class ReinforcedDynamics:
-    def __init__(self,
-                 config = "rid.yaml"
-                 ) -> None:
+    def __init__(
+            self,
+            config = "rid.yaml"
+    ) -> None:
         
         if config.endswith(".yaml") or config.endswith(".yml"):
+            logger.info(f"Parsing YAML File {config} ...")
             self.parser = YamlParser(config)
         else:
             raise TypeError("config should be a yaml file")
@@ -304,7 +306,6 @@ class ReinforcedDynamics:
         self.output_dir = Path(self.config["option"]["output_dir"])
         self.task_name = self.config["option"]["task_name"]
         self.storage_name = f"{self.task_name}.reporter.nc"
-        # self.model_path = self.output_dir / "model.{name}.{cycle}.{index}.pt"
         self.log_path = self.output_dir / f"{self.task_name}.log"
         if not os.path.exists(self.output_dir):
             os.makedirs(self.output_dir, exist_ok=True)

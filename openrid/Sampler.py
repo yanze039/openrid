@@ -101,7 +101,6 @@ class RestrainedMDSampler(object):
     def __init__(
             self, 
             topology_file, 
-            platform, 
             temperature, 
             cv_def,
             cv_func,
@@ -123,12 +122,11 @@ class RestrainedMDSampler(object):
         self.cv_func = cv_func
         self.topology_file = topology_file
 
-        # self.topology = pmd.load_file(str(self.topology_file))
-
-        if isinstance(platform, str):
-            self.platform = mm.Platform.getPlatformByName('CUDA')
-        else:
-            self.platform = platform
+        self.platform = mmtools.utils.get_fastest_platform()
+        logger.info(f"using {self.platform.getName()}")
+        if self.platform.getName() != "CUDA":
+            logger.warning("Not using CUDA can decrease the performance of the sampler.")
+            raise RuntimeError("SLURM Error, please use CUDA")
         if isinstance(temperature, Quantity):
             self.temperature = temperature
         else:
