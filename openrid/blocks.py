@@ -1,4 +1,5 @@
 import os
+import time
 import torch
 import copy
 from typing import List
@@ -84,7 +85,7 @@ class Exploration(object):
             raise TypeError("topology should be str or Path")
 
         self._system = topology.createSystem(nonbondedMethod=app.PME,
-                            nonbondedCutoff=1*unit.nanometer, constraints=app.HBonds)
+                            nonbondedCutoff=0.9*unit.nanometer, constraints=app.HBonds)
         self._system.addForce(mm.MonteCarloBarostat(pressure, temperatures[0]))
         
         thermodynamic_state_list = []
@@ -103,15 +104,16 @@ class Exploration(object):
                 trust_lvl_2 = [trust_lvl_2] * len(temperatures)
             
             for ii in range(len(temperatures)):
-                _model = torch.load(model_path)
-                _model.eval()
-                _model.set_e0(trust_lvl_1[ii])
-                _model.set_e1(trust_lvl_2[ii])
                 self.jitted_model_path = self.output_dir / (Path(model_path).stem + f"_state_{ii}_jitted.pt")
-                torch.jit.script(_model).save(str(self.jitted_model_path))
+                self.jit_model(model_path, trust_lvl_1[ii], trust_lvl_2[ii], self.jitted_model_path)
+                mpicomm = mpiplus.get_mpicomm()
+                try:
+                    mpicomm.barrier()
+                except AttributeError:
+                    pass
                 torch_force = ot.TorchForce(str(self.jitted_model_path))
                 torch_force.setOutputsForces(True)
-                torch_force.setUsesPeriodicBoundaryConditions(True)
+                torch_force.setUsesPeriodicBoundaryConditions(False)
                 system = copy.deepcopy(self._system)
                 system.addForce(torch_force)
                 system = self.set_force_group(system)
@@ -121,18 +123,39 @@ class Exploration(object):
                     n_steps=n_steps_per_iter, groups=groups, reassign_velocities=reassign_velocities)
         
         reporter_path = self.output_dir / reporter_name
-        self._sampler = ParallelTemperingSampler(mcmc_moves=move, number_of_iterations=n_remd_iters)
+        self._sampler = ParallelTemperingSampler(mcmc_moves=move, number_of_iterations=n_remd_iters, online_analysis_interval=None)
         self.analysis_particle_indices = np.array(analysis_particle_indices).flatten()
         self.reporter = reporter(reporter_path, checkpoint_interval=checkpoint_interval, analysis_particle_indices=self.analysis_particle_indices)
-        
+        self.max_attempt_number = 5
         if resume and os.path.exists(reporter_path):
-            self._sampler = self._sampler.from_storage(self.reporter)
+            is_sucessful = False
+            attempts = 0
+            while attempts < self.max_attempt_number:
+                try:
+                    self._sampler = self._sampler.from_storage(self.reporter)
+                    is_sucessful = True
+                    break
+                except FileNotFoundError:
+                    attempts += 1
+                    logger.info("Attemp to open storage files failed, try again.")
+                    time.sleep(3)
+                    continue
+            if not is_sucessful:
+                raise RuntimeError(f"Attempts to open file {str(reporter_path)} exceeds {self.max_attempt_number} times, raise an error.")
         else:
             self._sampler.create(thermodynamic_state_list, sampler_states, storage=self.reporter, temperatures=temperatures)
         
         
     def run(self):
         self._sampler.run()
+    
+    @mpiplus.on_single_node(0, sync_nodes=True)
+    def jit_model(self, model_path, e0, e1, output_path):
+        _model = torch.load(model_path)
+        _model.eval()
+        _model.set_e0(e0)
+        _model.set_e1(e1)
+        torch.jit.script(_model).save(output_path)
     
     def set_force_group(self, system):
         for force in system.getForces():
@@ -351,12 +374,10 @@ class RestrainedMDLabeler():
             info_interval=1000,
             output_dir=Path("data"),
             label_data_file_name="data.raw.npy",
-            reset_box=True,
-            platform="CUDA", 
+            reset_box=True
     ) -> None:
         self.sampler = RestrainedMDSampler(
             topology_file, 
-            platform, 
             temperature, 
             cv_def=cv_def,
             cv_func=cv_func,
@@ -385,7 +406,6 @@ class RestrainedMDLabeler():
         labels = np.zeros((n_data, n_cv*2))
         for i, cv_output in enumerate(cv_outputs):
             cv_label_data = self.calc_mean_force(cv_output)
-            print(cv_label_data)
             labels[i] = cv_label_data
         self.label_data_file = self.output_dir/self.label_data_file_name
         np.save(self.label_data_file, labels)
@@ -421,7 +441,6 @@ class RestrainedMDLabeler():
 if __name__ == "__main__":
     import netCDF4 as nc
     # data = nc.Dataset("/home/gridsan/ywang3/Project/rid_openmm/output/test.reporter.nc")
-    # print(data)
     reporter = mmtools.multistate.MultiStateReporter("/home/gridsan/ywang3/Project/rid_openmm/output/test.reporter.nc", open_mode='r')
     for ii in range(11):
         try:
