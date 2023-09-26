@@ -8,6 +8,14 @@
 * At least 20% improvement compared to Gmx+TF
 * Easy installation, one command
 
+## Quick Start
+There is an example in `example` folder, run the script below to see if it works.
+You can modify the `ala2.yaml` file to change the parameters.
+```
+cd example
+python run.py
+```
+
 ## Setup
 
 ```
