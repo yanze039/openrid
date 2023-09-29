@@ -10,11 +10,12 @@ CONFIG = {
         "num_rid_cycles": 20,
         "temperature": 300,
         "pressure": 1,
-        "initial_models": None,
+        "initial_model": None,
         "trust_lvl_1": 2,
         "trust_lvl_2": 3,
         "platform": "auto",
-        "resume": True
+        "resume": True,
+        "initial_data": None
     },
     "collective_variables": {
         "mode": "torsion",
