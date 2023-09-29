@@ -181,7 +181,7 @@ class Selector(object):
             n_cluaster_threshold = 8,
             n_cluster_lower_bound = 2,
             n_cluster_upper_bound = 4,
-            distance_threshold = 0.01,
+            distance_threshold = [0.01],
             threshold_mode="search",
             pick_mode="all",
             output_dir = Path("select"),
@@ -205,8 +205,10 @@ class Selector(object):
         self.cv_def = cv_def
         self.n_cluster_lower_bound = n_cluster_lower_bound
         self.n_cluster_upper_bound = n_cluster_upper_bound
+        self.max_selection = self.n_cluster_upper_bound
 
         self.distance_threshold = distance_threshold
+        self.distance_threshold_file = output_dir / "distance_threshold_{state}.txt"
         self.model_devi_threshold = model_devi_threshold
         self.threshold_mode = threshold_mode
         self.output_dir = Path(output_dir)
@@ -220,7 +222,7 @@ class Selector(object):
 
         assert self.pick_mode in ["all", "model"], "pick_mode must be all or model, found: {}".format(self.pick_mode)
         assert self.threshold_mode in ["search", "fixed"], "threshold_mode must be search or fixed, found: {}".format(self.threshold_mode)
-    
+
     def pick_by_model(self, storage):
         reporter = self.reporter(storage, open_mode='r')
         for state_index in range(reporter.n_states):
@@ -277,19 +279,37 @@ class Selector(object):
         diff[diff < -np.pi] += 2 * torch.pi
         diff[diff >  np.pi] -= 2 * torch.pi
         dist_map = torch.norm(diff, dim=-1)
-
-        if self.threshold_mode == "search":
-            cluster = self.search_distance_threshold(dist_map)
-        elif self.threshold_mode == "fixed":
+        
+        state_threshold = self.distance_threshold[state_index]
+        if self.threshold_mode == "fixed":
+            if len(dist_map) == 1:
+                self.write_n_cluster(1, self.output_dir / f"n_cluster_{state_index}.txt")
+                logger.info(" >>> only one conformer, skip clustering,")
+                self.write_to_file(reporter, selected_idx[0], state_index)
+                return
+            elif len(dist_map) == 0:
+                self.write_n_cluster(0, self.output_dir / f"n_cluster_{state_index}.txt")
+                logger.info(" >>> no cluster found, skip clustering,")
+                return
+            else:
+                logger.info(f" >>> distance_threshold for state {state_index}: {state_threshold}")
             cluster = skcluster.AgglomerativeClustering(n_clusters=None,
                                                 linkage='average',
                                                 metric='precomputed',
-                                                distance_threshold=self.distance_threshold
+                                                distance_threshold=state_threshold
                                                 )
             cluster.fit(dist_map)
-        else:
-            raise ValueError("mode must be search or fixed")
+            if len(np.unique(cluster.labels_)) > self.max_selection:
+                cluster, state_threshold = self.search_distance_threshold(dist_map)
         
+        elif self.threshold_mode == "search":
+            cluster, state_threshold = self.search_distance_threshold(dist_map)
+        else:
+            raise ValueError("threshold_mode must be search or fixed")
+            
+        
+        self.write_threshold(str(self.distance_threshold_file).format(state=state_index), state_threshold)
+
         self.output_dir.mkdir(exist_ok=True)
         self.write_n_cluster(len(np.unique(cluster.labels_)), self.output_dir / f"n_cluster_{state_index}.txt")
         for i_cluster in range(len(np.unique(cluster.labels_))):
@@ -324,14 +344,19 @@ class Selector(object):
         out_conf = str(self.output_dir / f"conf_{str(self.name)}_{state_index}_{sampler_index}.gro")
         pmd_topology.save(out_conf, overwrite=self.overwrite)
         logger.info(f" >>> Saved to file {out_conf}")
+    
+    def write_threshold(self, output_path, value):
+        with open(output_path, "w") as f:
+            f.write(str(value))
 
-    def search_distance_threshold(self, dist_map):
+    def search_distance_threshold(self, dist_map, init_threshold=0.01):
         if dist_map.shape[0] < self.n_cluster_lower_bound:
             logger.warn("n_cluster_lower_bound is larger than the number of conformers, set to the number of conformers"
                         f" n_cluster_lower_bound: {self.n_cluster_lower_bound} -> {(dist_map.shape[0])} "
                         "please consider using a smaller n_cluster_lower_bound")
             self.n_cluster_lower_bound = dist_map.shape[0]
-
+        
+        state_threshold = init_threshold
         n_cluster = 0
         cluster = None
         assert self.n_cluster_lower_bound is not None, "n_cluster_lower_bound must be specified"
@@ -341,23 +366,23 @@ class Selector(object):
             cluster = skcluster.AgglomerativeClustering(n_clusters=None,
                                                 linkage='average',
                                                 metric='precomputed',
-                                                distance_threshold=self.distance_threshold
+                                                distance_threshold=state_threshold
                                                 )
             cluster.fit(dist_map)
             n_cluster = len(np.unique(cluster.labels_))
             logger.info(f" >>> n_cluster: {n_cluster}")
             if n_cluster < self.n_cluster_lower_bound:
-                self.distance_threshold *= 0.9
+                state_threshold *= 0.9
             elif n_cluster > self.n_cluster_upper_bound:
-                self.distance_threshold *= 1.1
+                state_threshold *= 1.1
             else:
-                logger.info(f"distance_threshold: {self.distance_threshold}")
+                logger.info(f"distance_threshold: {state_threshold}")
                 break
 
         assert cluster is not None, "cluster is None, something wrong"
         logger.info(f" >>> Final searching result: n_cluster: {n_cluster}")
 
-        return cluster
+        return cluster, state_threshold
 
 
 class RestrainedMDLabeler():

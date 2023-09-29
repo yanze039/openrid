@@ -186,7 +186,6 @@ class RestrainedMDSampler(object):
         simulation_tag = Path(conformer).stem
         CV_out = Path(self.output_dir)/self.name_universe["CV_out"].format(simulation_tag=simulation_tag)
         traj_out = str(Path(self.output_dir)/self.name_universe["traj_out"].format(simulation_tag=simulation_tag))
-        info_out = str(Path(self.output_dir)/self.name_universe["info_out"].format(simulation_tag=simulation_tag))
         if os.path.exists(CV_out):
             logger.info("Collective variable file exists, skip.")
             return 
@@ -207,10 +206,6 @@ class RestrainedMDSampler(object):
         simulation.context.setPositions(coordinate_odj.positions)
         simulation.context.setVelocitiesToTemperature(self.temperature)
         simulation.reporters.append(pmd.openmm.NetCDFReporter(traj_out, self.traj_interval, crds=True))
-        logger.info(f"Trajectory file saved to {traj_out}")
-        # simulation.reporters.append(app.StateDataReporter(info_out, self.info_interval, step=True, time=True,
-        #         potentialEnergy=True, temperature=True, density=True))
-        logger.info(f"System information file saved to {info_out}")
         logger.info(f"Propagate system for {self.n_steps} steps ...")
         simulation.step(self.n_steps)
         
@@ -225,6 +220,8 @@ class RestrainedMDSampler(object):
         CV_values = self.clac_dihedral_angles(traj_out, self.cv_def, top=conformer)
         all_CV_values = np.concatenate((initial_CV.reshape(1, -1), CV_values), axis=0)
         np.savetxt(CV_out, all_CV_values)
+        logger.info(f"Collective variable values saved to {CV_out}.")
+        os.remove(traj_out)
     
     @property
     def name_universe(self):

@@ -48,7 +48,7 @@ class ReinforcedDynamicsLoop:
             n_cluaster_threshold = 8,
             n_cluster_lower_bound = 2,
             n_cluster_upper_bound = 4,
-            distance_threshold = 0.01,
+            distance_threshold = [0.1, 0.1, 0.1, 0.1],
             threshold_mode="search",
             pick_mode="all",
             n_model=4,
@@ -125,7 +125,7 @@ class ReinforcedDynamicsLoop:
         self.model_devi_threshold = init_trust_lvl_1
         self.init_trust_lvl_1 = init_trust_lvl_1
         self.init_trust_lvl_2 = init_trust_lvl_2
-        self.trained_model_path = self.model_dir / f"model_best.pt"
+        self.trained_model_path = str(self.model_dir / f"model_best.pt")
 
         self.progress = {
             "exploration": False,
@@ -170,7 +170,11 @@ class ReinforcedDynamicsLoop:
         if not self.progress["selection"]:
             self.run_selection()
             self.progress["selection"] = True
-            self.distance_threshold = self.selection_step.distance_threshold
+            distance_files = list(Path(self.selection_output_dir).glob("distance_*.txt"))
+            for f in distance_files:
+                state_idx = int(f.stem.split("_")[-1])
+                with open(f, "r") as f:
+                    self.distance_threshold[state_idx] = float(f.read().strip())
             self.write_checkpoint()
         if not self.progress["labeling"]:
             conformers = list(Path(self.loop_output_dir/"select").glob("*.gro"))
@@ -345,14 +349,16 @@ class ReinforcedDynamics:
             if cycle == 0:
                 threshold_mode="search"
                 pick_mode="all"
-                distance_threshold = float(self.config["selection"]["cluster_threshold"])
+                distance_threshold = self.config["selection"]["cluster_threshold"]
                 prior_data=self.config["option"]["initial_data"]
             else:
                 threshold_mode="fixed"
                 pick_mode="model"
-                distance_threshold = float(self.record[str(cycle-1)]["distance_threshold"])
+                distance_threshold = self.record[str(cycle-1)]["distance_threshold"]
                 prior_data = self.record[str(cycle-1)]["data_file"]
-            assert isinstance(distance_threshold, float)
+            if isinstance(distance_threshold, float):
+                distance_threshold = [float(distance_threshold) for _ in range(self.n_replicas)]
+            assert isinstance(distance_threshold, list)
             trust_lvl_1, trust_lvl_2 = self.get_trust_lvl()
             prior_model_path = self.get_model_path()
             loop_output_dir = self.output_dir / f"round_{cycle}"
@@ -383,7 +389,7 @@ class ReinforcedDynamics:
                 n_cluaster_threshold = self.n_cluster_threshold,
                 n_cluster_lower_bound = self.config["selection"]["n_cluster_lower"],
                 n_cluster_upper_bound = self.config["selection"]["n_cluster_upper"],
-                distance_threshold = float(distance_threshold),
+                distance_threshold = distance_threshold,
                 threshold_mode=threshold_mode, 
                 pick_mode=pick_mode, 
                 n_model=self.config["Train"]["n_models"],
@@ -413,7 +419,7 @@ class ReinforcedDynamics:
         if not hasattr(self, "cycle_index"):
             self.recover_cycle_index()
         if self.cycle_index == 0:
-            return self.config["option"]["initial_models"]
+            return self.config["option"]["initial_model"]
         else:
             return self.record[str(self.cycle_index-1)]["model_path"]
     
