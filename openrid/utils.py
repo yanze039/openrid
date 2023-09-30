@@ -245,3 +245,5 @@ def calc_dihedral(conf):
 def jit_script_to(model, output_path):
     torch.jit.script(model).save(output_path)
     return output_path
+
+

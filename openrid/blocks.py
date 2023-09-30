@@ -338,8 +338,11 @@ class Selector(object):
         box_vectors = reporter.read_sampler_states(
                         sampler_index, analysis_particles_only=False
                     )[state_index].box_vectors
-        pmd_topology = pmd.load_file(self.topology_file)
-        pmd_topology.box_vectors = box_vectors
+        if str(self.topology_file).endswith(".top"):
+            topology = app.GromacsTopFile(self.topology_file, periodicBoxVectors=box_vectors)
+        else:
+            raise RuntimeError("topology must be a .top file")
+        pmd_topology = pmd.load_topology(topology)
         pmd_topology.positions = positions
         out_conf = str(self.output_dir / f"conf_{str(self.name)}_{state_index}_{sampler_index}.gro")
         pmd_topology.save(out_conf, overwrite=self.overwrite)
