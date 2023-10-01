@@ -35,12 +35,13 @@ class Exploration(object):
             model_path,
             temperatures: List[Quantity], 
             pressure: Quantity, 
-            timestep, 
+            timestep,
             n_remd_iters,
             n_steps_per_iter, 
             reporter, 
             reporter_name, 
             checkpoint_interval,
+            timestep_nn=None,
             trust_lvl_1=None, 
             trust_lvl_2=None,
             platform="CUDA",
@@ -53,7 +54,10 @@ class Exploration(object):
         ) -> None:
 
         self.output_dir = Path(output_dir)
-
+        if timestep_nn is None:
+            timestep_nn = timestep
+        self.timestep_nn = timestep_nn
+        assert float(timestep_nn.value_in_unit(unit.picoseconds)) % float(timestep.value_in_unit(unit.picoseconds)) == 0, "timestep_nn must be a multiple of timestep"
         # create sampler states
         if isinstance(confs, str) or isinstance(confs, Path):
             confs_list = [confs]
@@ -75,6 +79,7 @@ class Exploration(object):
             sampler_states.append(sampler_state)
         
         # create system
+        self.topology_file = topology
         if isinstance(topology, str) or isinstance(topology, Path):
             if str(topology).endswith(".top"):
                 assert coordinate_odj is not None, "coordinate_odj must be specified!"
@@ -119,20 +124,39 @@ class Exploration(object):
                 system = self.set_force_group(system)
                 assert groups is not None, "force groups must be specified!"
                 thermodynamic_state_list.append(mmtools.states.ThermodynamicState(system, temperature=temperatures[ii]))
-            move = MTSLangevinDynamicsMove(timestep=timestep, collision_rate=collision_rate,
-                    n_steps=n_steps_per_iter, groups=groups, reassign_velocities=reassign_velocities)
+            ratio = float(timestep_nn.value_in_unit(unit.picoseconds)) / float(timestep.value_in_unit(unit.picoseconds))
+            n_steps_per_iter_nn = int(n_steps_per_iter / ratio)
+            move = MTSLangevinDynamicsMove(timestep=self.timestep_nn, collision_rate=collision_rate,
+                    n_steps=n_steps_per_iter_nn, groups=groups, reassign_velocities=reassign_velocities)
         
-        reporter_path = self.output_dir / reporter_name
+        self.reporter_path = self.output_dir / reporter_name
         self._sampler = ParallelTemperingSampler(mcmc_moves=move, number_of_iterations=n_remd_iters, online_analysis_interval=None)
         self.analysis_particle_indices = np.array(analysis_particle_indices).flatten()
-        self.reporter = reporter(reporter_path, checkpoint_interval=checkpoint_interval, analysis_particle_indices=self.analysis_particle_indices)
+        _reporter = reporter(self.reporter_path, checkpoint_interval=checkpoint_interval, analysis_particle_indices=self.analysis_particle_indices)
+        self.reporter = reporter
         self.max_attempt_number = 5
-        if resume and os.path.exists(reporter_path):
+        
+        # test if storage exists. We need to set a barrier here because some workers are 
+        # faster. If storage is already created by rank-0, then others ranks will detect 
+        # this file and try to load states from storage rather than create a new one.
+        # this may lead to bugs: 1) rank-0 will be waiting for the barrier after init_reporter
+        # which some ranks will never reach. 2) some ranks can't load anything from empty storage
+        # created by rank-0 and raise an error.
+        # other cases, mpi is disabled, and we got AttributeError since mpicomm is None.
+        # simplified to check if storage exists.
+        try:
+            mpicomm = mpiplus.get_mpicomm()
+            storage_exists = _reporter.storage_exists()
+            mpicomm.barrier()
+        except AttributeError:
+            storage_exists = _reporter.storage_exists()
+
+        if resume and storage_exists:
             is_sucessful = False
             attempts = 0
             while attempts < self.max_attempt_number:
                 try:
-                    self._sampler = self._sampler.from_storage(self.reporter)
+                    self._sampler = self._sampler.from_storage(_reporter)
                     is_sucessful = True
                     break
                 except FileNotFoundError:
@@ -141,13 +165,13 @@ class Exploration(object):
                     time.sleep(3)
                     continue
             if not is_sucessful:
-                raise RuntimeError(f"Attempts to open file {str(reporter_path)} exceeds {self.max_attempt_number} times, raise an error.")
+                raise RuntimeError(f"Attempts to open file {str(self.reporter_path)} exceeds {self.max_attempt_number} times, raise an error.")
         else:
-            self._sampler.create(thermodynamic_state_list, sampler_states, storage=self.reporter, temperatures=temperatures)
-        
+            self._sampler.create(thermodynamic_state_list, sampler_states, storage=_reporter, temperatures=temperatures)
         
     def run(self):
         self._sampler.run()
+        self.write_final_confomers()
     
     @mpiplus.on_single_node(0, sync_nodes=True)
     def jit_model(self, model_path, e0, e1, output_path):
@@ -158,6 +182,8 @@ class Exploration(object):
         torch.jit.script(_model).save(output_path)
     
     def set_force_group(self, system):
+        """Seperate forces into different groups for MTS integrator.
+        """
         for force in system.getForces():
             if type(force) in Force_Group_Index:
                 force.setForceGroup(Force_Group_Index[type(force)])
@@ -165,6 +191,29 @@ class Exploration(object):
                 assert type(force) == mm.Force
                 force.setForceGroup(Force_Group_Index["SlowForce"])
         return system
+    
+    def write_final_confomers(self):
+        """Write final conformers to .gro files. 
+           Will be used as the inital point for the next round of exploration.
+        """
+        _reporter = self.reporter(self.reporter_path, open_mode='r')
+        last_index = _reporter.read_last_iteration()
+        n_states = _reporter.n_states
+        for state_index in range(n_states):
+            positions = _reporter.read_sampler_states(
+                            last_index, analysis_particles_only=False
+                        )[state_index].positions
+            box_vectors = _reporter.read_sampler_states(
+                            last_index, analysis_particles_only=False
+                        )[state_index].box_vectors
+            if str(self.topology_file).endswith(".top"):
+                gmx_top = app.GromacsTopFile(self.topology_file, periodicBoxVectors=box_vectors)
+            else:
+                raise RuntimeError("topology must be a .top file")
+            pmd_topology = pmd.openmm.load_topology(gmx_top.topology, xyz=positions)
+            out_conf = str(self.output_dir / f"conf_{state_index}.gro")
+            pmd_topology.save(out_conf, overwrite=True)
+            logger.info(f" >>> Saved to file {out_conf}")
 
 
 class Selector(object):
@@ -222,11 +271,6 @@ class Selector(object):
 
         assert self.pick_mode in ["all", "model"], "pick_mode must be all or model, found: {}".format(self.pick_mode)
         assert self.threshold_mode in ["search", "fixed"], "threshold_mode must be search or fixed, found: {}".format(self.threshold_mode)
-
-    def pick_by_model(self, storage):
-        reporter = self.reporter(storage, open_mode='r')
-        for state_index in range(reporter.n_states):
-            self.pick_per_state(reporter, state_index)
     
     def select(self, storage):
         reporter = self.reporter(storage, open_mode='r')
@@ -338,6 +382,7 @@ class Selector(object):
         box_vectors = reporter.read_sampler_states(
                         sampler_index, analysis_particles_only=False
                     )[state_index].box_vectors
+        # parmed has bugs to load some old GROMACS files. Use openmm instead.
         if str(self.topology_file).endswith(".top"):
             gmx_top = app.GromacsTopFile(self.topology_file, periodicBoxVectors=box_vectors)
         else:
@@ -464,19 +509,3 @@ class RestrainedMDLabeler():
         cv_label_data = np.concatenate((centers, ff))
 
         return cv_label_data
-
-
-if __name__ == "__main__":
-    import netCDF4 as nc
-    # data = nc.Dataset("/home/gridsan/ywang3/Project/rid_openmm/output/test.reporter.nc")
-    reporter = mmtools.multistate.MultiStateReporter("/home/gridsan/ywang3/Project/rid_openmm/output/test.reporter.nc", open_mode='r')
-    for ii in range(11):
-        try:
-            tmp_cv_slice = reporter.read_sampler_states(ii, analysis_particles_only=False)[0].positions.value_in_unit(unit.nanometer)
-            print(f"found {ii}")
-        except:
-            print(ii, "can't find")
-
-    # sele = Selector(
-    #     model_list=["../data/model_0.pt", "../data/model_1.pt", "../data/model_2.pt", "../data/model_3.pt"],
-    # )

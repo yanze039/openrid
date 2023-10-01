@@ -35,6 +35,7 @@ class ReinforcedDynamicsLoop:
             temperature_ladder = [],
             pressure = 1.0, 
             timestep = 4.0*unit.femtosecond, 
+            timestep_nn = 4.0*unit.femtosecond,
             collision_rate = 1.0/unit.picoseconds,
             reporter = mmtools.multistate.MultiStateReporter, 
             reporter_name = "reporter.nc", 
@@ -71,6 +72,7 @@ class ReinforcedDynamicsLoop:
         self.temperature_ladder = temperature_ladder
         self.pressure = pressure
         self.timestep = timestep
+        self.timestep_nn = timestep_nn
         self.n_remd_iters = n_remd_iters
         self.n_steps_per_iter = n_steps_per_iter
         self.reporter = reporter
@@ -80,6 +82,8 @@ class ReinforcedDynamicsLoop:
         self.platform = platform
         self.collision_rate = collision_rate
         self.cv_def = cv_def
+
+        
 
         # selection
         self.trust_lvl_1 = trust_lvl_1
@@ -112,6 +116,7 @@ class ReinforcedDynamicsLoop:
             os.makedirs(self.exploration_dir, exist_ok=True)
         self.reporter_name = reporter_name
         self.reporter_path = self.exploration_dir / self.reporter_name
+        self.exploration_final_confs = [self.exploration_dir / f"conf_{state_index}.gro" for state_index in range(len(self.temperature_ladder))]
 
         self.checkpoint = self.loop_output_dir / "loop_checkpoint.json"
         self.selection_output_dir = self.loop_output_dir / "select"
@@ -201,6 +206,7 @@ class ReinforcedDynamicsLoop:
                     reporter=self.reporter, 
                     reporter_name=self.reporter_name, 
                     checkpoint_interval=self.checkpoint_interval_exploration,
+                    timestep_nn=self.timestep_nn,
                     trust_lvl_1=self.trust_lvl_1, 
                     trust_lvl_2=self.trust_lvl_2,
                     platform=self.platform,
@@ -351,11 +357,13 @@ class ReinforcedDynamics:
                 pick_mode="all"
                 distance_threshold = self.config["selection"]["cluster_threshold"]
                 prior_data=self.config["option"]["initial_data"]
+                confs = self.config["option"]["initial_conformers"]
             else:
                 threshold_mode="fixed"
                 pick_mode="model"
                 distance_threshold = self.record[str(cycle-1)]["distance_threshold"]
                 prior_data = self.record[str(cycle-1)]["data_file"]
+                confs = self.record[str(cycle-1)]["final_confs"]
             if isinstance(distance_threshold, float):
                 distance_threshold = [float(distance_threshold) for _ in range(self.n_replicas)]
             assert isinstance(distance_threshold, list)
@@ -364,7 +372,7 @@ class ReinforcedDynamics:
             loop_output_dir = self.output_dir / f"round_{cycle}"
             block = ReinforcedDynamicsLoop(
                 index=cycle,
-                confs=self.config["option"]["initial_conformers"], 
+                confs=confs, 
                 topology=self.config["option"]["topology_file"],
                 temperature = self.config["option"]["temperature"]* unit.kelvin,
                 temperature_ladder = [t * unit.kelvin for t in self.config["exploration"]["temperature_ladder"]],
@@ -382,6 +390,7 @@ class ReinforcedDynamics:
                 prior_model_path=prior_model_path,
                 platform=self.platform,
                 cv_def=self.config["collective_variables"]["cv_indices"],
+                timestep_nn=self.config["exploration"]["time_step_nn"] * unit.picoseconds,
                 trust_lvl_1=trust_lvl_1,
                 trust_lvl_2=trust_lvl_2,
                 init_trust_lvl_1= self.init_trust_lvl_1,
@@ -406,6 +415,7 @@ class ReinforcedDynamics:
             self.record[str(cycle)]["trust_lvl_2"] = trust_lvl_2.tolist()
             self.record[str(cycle)]["model_path"] = str(block.trained_model_path)
             self.record[str(cycle)]["data_file"] = str(block.data_file)
+            self.record[str(cycle)]["final_confs"] = [str(c) for c in block.exploration_final_confs]
 
             self.suggest_trust_lvl(block, cycle)
             self.write_checkpoint()
