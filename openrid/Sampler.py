@@ -12,6 +12,7 @@ import mpiplus
 from openmmtools.multistate import ReplicaExchangeSampler
 from openmmtools import constants
 import openmmtools as mmtools
+from openmmtools import utils
 import openmm.app as app
 from openmm import unit
 from openmm.unit.quantity import Quantity
@@ -95,6 +96,71 @@ class ParallelTemperingSampler(ReplicaExchangeSampler):
 
         # Return the new energies.
         return energy_neighborhood_states, energy_unsampled_states
+    
+    @mmtools.utils.with_timer('Propagating all replicas')
+    def _propagate_replicas(self):
+        """Propagate all replicas."""
+        # TODO  Report on efficiency of dynamics (fraction of time wasted to overhead).
+        logger.debug("Propagating all replicas...")
+
+        # Distribute propagation across nodes. Only node 0 will get all positions
+        # and box vectors. The other nodes, only need the positions that they use
+        # for propagation and computation of the energy matrix entries.
+        propagated_states, replica_ids = mpiplus.distribute(self._propagate_replica, range(self.n_replicas),
+                                                        send_results_to=0, sync_nodes=True)
+
+        # Update all sampler states. For non-0 nodes, this will update only the
+        # sampler states associated to the replicas propagated by this node.
+        for replica_id, propagated_state in zip(replica_ids, propagated_states):
+            self._sampler_states[replica_id].__setstate__(propagated_state, ignore_velocities=False)
+
+        # Gather all MCMCMoves statistics. All nodes must have these up-to-date
+        # since they are tied to the ThermodynamicState, not the replica.
+        all_statistics = mpiplus.distribute(self._get_replica_move_statistics, range(self.n_replicas),
+                                        send_results_to='all', sync_nodes=True)
+        for replica_id in range(self.n_replicas):
+            if len(all_statistics[replica_id]) > 0:
+                thermodynamic_state_id = self._replica_thermodynamic_states[replica_id]
+                self._mcmc_moves[thermodynamic_state_id].statistics = all_statistics[replica_id]
+    
+    @mpiplus.on_single_node(0, broadcast_result=True, sync_nodes=True)
+    def _mix_replicas(self):
+        """Attempt to swap replicas according to user-specified scheme."""
+        logger.debug("Mixing replicas...")
+
+        # Reset storage to keep track of swap attempts this iteration.
+        self._n_accepted_matrix[:, :] = 0
+        self._n_proposed_matrix[:, :] = 0
+
+        # Perform swap attempts according to requested scheme.
+        with utils.time_it('Mixing of replicas'):
+            if self.replica_mixing_scheme == 'swap-neighbors':
+                self._mix_neighboring_replicas()
+            elif self.replica_mixing_scheme == 'swap-all':
+                nswap_attempts = self.n_replicas**3
+                # Try to use numba-accelerated mixing code if possible,
+                # otherwise fall back to Python-accelerated code.
+                try:
+                    self._mix_all_replicas_numba(
+                        nswap_attempts, self.n_replicas,
+                        self._replica_thermodynamic_states, self._energy_thermodynamic_states,
+                        self._n_accepted_matrix, self._n_proposed_matrix
+                        )
+                except (ValueError, ImportError) as e:
+                    logger.warning(str(e))
+                    self._mix_all_replicas(nswap_attempts)
+            else:
+                assert self.replica_mixing_scheme is None
+
+        # Determine fraction of swaps accepted this iteration.
+        n_swaps_proposed = self._n_proposed_matrix.sum()
+        n_swaps_accepted = self._n_accepted_matrix.sum()
+        swap_fraction_accepted = 0.0
+        if n_swaps_proposed > 0:
+            swap_fraction_accepted = n_swaps_accepted / n_swaps_proposed
+        logger.debug("Accepted {}/{} attempted swaps ({:.1f}%)".format(n_swaps_accepted, n_swaps_proposed,
+                                                                       swap_fraction_accepted * 100.0))
+        return self._replica_thermodynamic_states
 
 
 class RestrainedMDSampler(object):

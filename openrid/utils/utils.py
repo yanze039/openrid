@@ -4,6 +4,7 @@ import inspect
 import logging
 from openmm import unit
 import openmmtools as mmtools
+import mpiplus
 
 
 def is_terminal_verbose():
@@ -247,3 +248,9 @@ def jit_script_to(model, output_path):
     return output_path
 
 
+def set_barrier():
+    try:
+        mpicomm = mpiplus.get_mpicomm()
+        mpicomm.barrier()
+    except AttributeError:
+        pass

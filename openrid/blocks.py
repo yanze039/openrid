@@ -12,6 +12,7 @@ from openrid.constants import Force_Group_Index
 from openrid.Propagator import MTSLangevinDynamicsMove
 from openrid.Sampler import ParallelTemperingSampler, RestrainedMDSampler
 from openrid.colvar import calc_diherals
+from openrid.utils import set_barrier
 
 # openmm related
 import openmm as mm
@@ -168,6 +169,7 @@ class Exploration(object):
                 raise RuntimeError(f"Attempts to open file {str(self.reporter_path)} exceeds {self.max_attempt_number} times, raise an error.")
         else:
             self._sampler.create(thermodynamic_state_list, sampler_states, storage=_reporter, temperatures=temperatures)
+        set_barrier()
         
     def run(self):
         self._sampler.run()
