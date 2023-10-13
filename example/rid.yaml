@@ -1,0 +1,63 @@
+option:
+  initial_conformers: ["/home/gridsan/ywang3/Project/rid_openmm/data/unfold/conf000.gro"]
+  topology_file: "/home/gridsan/ywang3/Project/rid_openmm/data/unfold/topol.top"
+  task_name: test
+  num_rid_cycles: 20
+  temperature: 340
+  pressure: 1
+  initial_model: null
+  trust_lvl_1: 3
+  trust_lvl_2: 4
+  output_dir: /home/gridsan/ywang3/Project/rid_openmm/chi_out5
+
+
+collective_variables:
+  # mode is either torsion or distance
+  mode: torsion
+  # torsion_indices: List[List[int]], a list of torsion indices w. shape [*, 4]
+  # starts with 0 !!!
+  cv_indices: [[0, 4, 21, 23], [21, 23, 25, 42], [23, 25, 42, 44], [42, 44, 46, 54], [44, 46, 54, 56], [54, 56, 60, 68], [56, 60, 68, 70], [68, 70, 72, 83], [70, 72, 83, 85], [83, 85, 87, 97], [85, 87, 97, 99], [97, 99, 101, 104], [99, 101, 104, 106], [104, 106, 108, 118], [106, 108, 118, 120], [118, 120, 122, 142], [120, 122, 142, 144], [142, 144, 146, 163]]
+
+
+exploration:
+  n_replicas: 2
+  # n_remd_iters: 500
+  # n_steps_per_iter: 500
+  n_steps: 500000
+  traj_interval: 500
+  info_interval: 5000
+  time_step: 0.002
+  is_mts: True
+  time_step_nn: 0.004
+  # checkpoint_interval: 1  # for the openmmtools reporter
+  checkpoint_interval: 5000
+  temperature_ladder: [340, 344, 349, 353, 357, 362, 366, 371]
+
+selection:
+  # distance cutoff for clustering
+  cluster_threshold: 0.5
+  n_cluster_lower: 50
+  n_cluster_upper: 80
+  n_cluster_threshold: 10
+
+labeling:
+  n_steps: 50000
+  checkpoint_interval: 50
+  time_step: 0.002
+  kappa: 500
+
+Train:
+  n_models: 4
+  neurons: [128, 128, 128, 128]
+  resnet: true
+  batch_size: 64
+  epochs: 6000
+  init_lr: 0.0008
+  decay_steps: 120
+  decay_rate: 0.96
+  drop_out_rate: 0.1
+  use_mix: false
+  restart: false
+  
+
+    
