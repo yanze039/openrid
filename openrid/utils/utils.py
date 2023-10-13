@@ -3,7 +3,9 @@ import torch
 import inspect
 import logging
 from openmm import unit
+import openmm as mm
 import openmmtools as mmtools
+from openmm.app import GromacsTopFile
 import mpiplus
 
 
@@ -254,3 +256,19 @@ def set_barrier():
         mpicomm.barrier()
     except AttributeError:
         pass
+
+
+def RelaxConfiguration(positions, system):
+    """
+    Relax the given configuration using a 1fs timestep and 10 steps of steepest descent.
+    """
+    # Set the positions
+    _state = mmtools.states.ThermodynamicState(system=system, temperature=300*unit.kelvin)
+    _integrator = mmtools.integrators.LangevinIntegrator(temperature=300.0*unit.kelvin)
+    context = _state.create_context(_integrator)
+    context.setPositions(positions)
+    # Minimize the energy
+    mm.LocalEnergyMinimizer.minimize(context)
+    
+    return context.getState(getPositions=True, getEnergy=True).getPositions()
+
