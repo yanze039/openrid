@@ -182,7 +182,6 @@ class RestrainedMDSampler(object):
             reset_box=True,
     ) -> None:
         
-        
         self.cv_def = np.array(cv_def, dtype=np.int32)
         
         self.cv_func = cv_func
@@ -273,6 +272,7 @@ class RestrainedMDSampler(object):
         simulation.context.setVelocitiesToTemperature(self.temperature)
         simulation.reporters.append(pmd.openmm.NetCDFReporter(traj_out, self.traj_interval, crds=True))
         logger.info(f"Propagate system for {self.n_steps} steps ...")
+        simulation.minimizeEnergy()
         simulation.step(self.n_steps)
         
         # we need to finalize the reporters to close the files, otherwise MDTraj can't read them proporly.

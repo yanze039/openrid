@@ -2,6 +2,7 @@ import os
 import logging
 import json
 import torch
+import random
 import shutil
 import numpy as np
 from pathlib import Path
@@ -13,7 +14,7 @@ from openmm import unit
 from openrid.colvar import calc_diherals_from_positions
 from openrid.model import NeuralNetworkManager, DihedralBiasVmap
 from openrid.Parser import YamlParser
-from openrid.blocks import Exploration, Selector, RestrainedMDLabeler
+from openrid.blocks import Exploration, Selector, RestrainedMDLabeler, ConcurrentExploration
 import openrid.utils as utils
 
 logger = logging.getLogger(__name__)
@@ -23,11 +24,14 @@ class ReinforcedDynamicsLoop:
     def __init__(
             self, 
             index,
+            n_replicas,
             confs, 
             topology,
             cv_def,
-            n_remd_iters,
-            n_steps_per_iter, 
+            n_steps_exploration,
+            traj_interval_exploration,
+            info_interval_exploration,
+            trajectory_checkpoint_interval_exploration,
             n_steps_labeling,
             checkpoint_interval_labeling,
             restraint_constant,
@@ -39,7 +43,9 @@ class ReinforcedDynamicsLoop:
             collision_rate = 1.0/unit.picoseconds,
             reporter = mmtools.multistate.MultiStateReporter, 
             reporter_name = "reporter.nc", 
-            checkpoint_interval_exploration = 2,
+            reporter_checkpoint_interval_exploration = 2,
+            n_remd_iters=800,
+            n_steps_per_iter=500, 
             prior_model_path=None,
             platform="CUDA",
             trust_lvl_1=None,
@@ -59,8 +65,11 @@ class ReinforcedDynamicsLoop:
             loop_output_dir=Path("loop"),
             resume=True,
             prior_data=None,
+            exploration_mode="concurrent",
+            shuffle_temperature=True,
         ) -> None:
         self.index = index
+        self.n_replicas = n_replicas
         if isinstance(confs, str) or isinstance(confs, Path):
             self.confs = [confs]
         elif isinstance(confs, list):
@@ -70,20 +79,27 @@ class ReinforcedDynamicsLoop:
         self.topology = topology
         self.temperature = temperature
         self.temperature_ladder = temperature_ladder
+        if shuffle_temperature:
+            random.shuffle(self.temperature_ladder)
+
         self.pressure = pressure
         self.timestep = timestep
         self.timestep_nn = timestep_nn
         self.n_remd_iters = n_remd_iters
         self.n_steps_per_iter = n_steps_per_iter
         self.reporter = reporter
-        
-        self.checkpoint_interval_exploration = checkpoint_interval_exploration
+        self.exploration_mode = exploration_mode
+        if self.exploration_mode == "concurrent":
+            self.checkpoint_interval_exploration = trajectory_checkpoint_interval_exploration
+        else:
+            self.checkpoint_interval_exploration = reporter_checkpoint_interval_exploration
+        self.exploration_n_steps = n_steps_exploration
+        self.exploration_traj_interval = traj_interval_exploration
+        self.exploration_info_interval = info_interval_exploration
 
         self.platform = platform
         self.collision_rate = collision_rate
         self.cv_def = cv_def
-
-        
 
         # selection
         self.trust_lvl_1 = trust_lvl_1
@@ -117,7 +133,10 @@ class ReinforcedDynamicsLoop:
         self.reporter_name = reporter_name
         self.reporter_path = self.exploration_dir / self.reporter_name
         self.exploration_final_confs = [self.exploration_dir / f"conf_{state_index}.gro" for state_index in range(len(self.temperature_ladder))]
-
+        
+        self.exploration_trajs = [
+            str(self.exploration_dir / (Path(reporter_name).stem + f"_{i}" + Path(self.reporter_name).suffix)) for i in range(n_replicas)
+        ]
         self.checkpoint = self.loop_output_dir / "loop_checkpoint.json"
         self.selection_output_dir = self.loop_output_dir / "select"
         self.labeling_output_dir = self.loop_output_dir / "label"
@@ -194,29 +213,53 @@ class ReinforcedDynamicsLoop:
         
         
     def run_exploration(self):
-        self.exploration_step = Exploration(
-                    topology=self.topology, 
-                    confs=self.confs, 
-                    model_path=self.prior_model_path,
-                    temperatures=self.temperature_ladder, 
-                    pressure=self.pressure, 
-                    timestep=self.timestep, 
-                    n_remd_iters=self.n_remd_iters,
-                    n_steps_per_iter=self.n_steps_per_iter, 
-                    reporter=self.reporter, 
-                    reporter_name=self.reporter_name, 
-                    checkpoint_interval=self.checkpoint_interval_exploration,
-                    timestep_nn=self.timestep_nn,
-                    trust_lvl_1=self.trust_lvl_1, 
-                    trust_lvl_2=self.trust_lvl_2,
-                    platform=self.platform,
-                    groups=[(0,2), (1,1)], 
-                    collision_rate=self.collision_rate,
-                    reassign_velocities=True,
-                    output_dir=self.exploration_dir,
-                    analysis_particle_indices=self.cv_def,
-                    resume=self.resume,
-                )
+        if self.exploration_mode == "concurrent":
+            self.exploration_step = ConcurrentExploration(
+                topology=self.topology, 
+                confs=self.confs, 
+                n_replicas=self.n_replicas,
+                model_path=self.prior_model_path,
+                temperatures=self.temperature_ladder, 
+                pressure=self.pressure, 
+                timestep=self.timestep,
+                reporter_name=self.reporter_name,
+                cv_def=self.cv_def,
+                n_steps=self.exploration_n_steps,
+                traj_interval=self.exploration_traj_interval,
+                info_interval=self.exploration_info_interval,
+                chk_interval=self.checkpoint_interval_exploration,
+                timestep_nn=self.timestep_nn,
+                trust_lvl_1=self.trust_lvl_1, 
+                trust_lvl_2=self.trust_lvl_2,
+                groups=[(0,2), (1,1)], 
+                collision_rate=self.collision_rate,
+                output_dir=self.exploration_dir,
+                resume=True
+            )
+        else:
+            self.exploration_step = Exploration(
+                        topology=self.topology, 
+                        confs=self.confs, 
+                        model_path=self.prior_model_path,
+                        temperatures=self.temperature_ladder, 
+                        pressure=self.pressure, 
+                        timestep=self.timestep, 
+                        n_remd_iters=self.n_remd_iters,
+                        n_steps_per_iter=self.n_steps_per_iter, 
+                        reporter=self.reporter, 
+                        reporter_name=self.reporter_name, 
+                        checkpoint_interval=self.checkpoint_interval_exploration,
+                        timestep_nn=self.timestep_nn,
+                        trust_lvl_1=self.trust_lvl_1, 
+                        trust_lvl_2=self.trust_lvl_2,
+                        platform=self.platform,
+                        groups=[(0,2), (1,1)], 
+                        collision_rate=self.collision_rate,
+                        reassign_velocities=True,
+                        output_dir=self.exploration_dir,
+                        analysis_particle_indices=self.cv_def,
+                        resume=self.resume,
+                    )
         
         self.exploration_step.run()
 
@@ -236,9 +279,13 @@ class ReinforcedDynamicsLoop:
             threshold_mode=self.threshold_mode,
             pick_mode=self.pick_mode,
             output_dir = self.selection_output_dir,
-            overwrite = True
+            overwrite = True,
+            groTopology = self.exploration_final_confs[0],
         )
-        self.selection_step.select(self.reporter_path)
+        if self.exploration_mode == "concurrent":
+            self.selection_step.select(self.exploration_trajs, mode="traj")
+        else:
+            self.selection_step.select(self.reporter_path, mode="reporter")
     
     def run_labeling(self, conformers):
         self.labeling_step = RestrainedMDLabeler(
@@ -373,6 +420,7 @@ class ReinforcedDynamics:
             block = ReinforcedDynamicsLoop(
                 index=cycle,
                 confs=confs, 
+                n_replicas=self.n_replicas,
                 topology=self.config["option"]["topology_file"],
                 temperature = self.config["option"]["temperature"]* unit.kelvin,
                 temperature_ladder = [t * unit.kelvin for t in self.config["exploration"]["temperature_ladder"]],
@@ -381,12 +429,15 @@ class ReinforcedDynamics:
                 collision_rate=self.config["exploration"]["collision_rate"] / unit.picoseconds,
                 n_remd_iters = self.config["exploration"]["n_remd_iters"],
                 n_steps_per_iter = self.config["exploration"]["n_steps_per_iter"],
+                n_steps_exploration = self.config["exploration"]["n_steps"],
+                traj_interval_exploration = self.config["exploration"]["traj_interval"],
+                info_interval_exploration = self.config["exploration"]["info_interval"],
+                trajectory_checkpoint_interval_exploration = self.config["exploration"]["checkpoint_interval"],
                 n_steps_labeling = self.config["labeling"]["n_steps"],
                 checkpoint_interval_labeling = self.config["labeling"]["checkpoint_interval"],
                 restraint_constant = self.config["labeling"]["kappa"] * unit.kilojoules_per_mole / (unit.radian**2),
                 reporter = mmtools.multistate.MultiStateReporter, 
                 reporter_name = str(self.storage_name),
-                checkpoint_interval_exploration = self.config["exploration"]["checkpoint_interval"],
                 prior_model_path=prior_model_path,
                 platform=self.platform,
                 cv_def=self.config["collective_variables"]["cv_indices"],
@@ -416,7 +467,7 @@ class ReinforcedDynamics:
             self.record[str(cycle)]["model_path"] = str(block.trained_model_path)
             self.record[str(cycle)]["data_file"] = str(block.data_file)
             self.record[str(cycle)]["final_confs"] = [str(c) for c in block.exploration_final_confs]
-
+            self.record[str(cycle)]["temperature_ladder"] = [float(t.value_in_unit(unit.kelvin)) for t in block.temperature_ladder]
             self.suggest_trust_lvl(block, cycle)
             self.write_checkpoint()
             mpicomm = mpiplus.get_mpicomm()
