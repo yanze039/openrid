@@ -260,7 +260,6 @@ def set_barrier():
 
 def RelaxConfiguration(positions, system):
     """
-    Relax the given configuration using a 1fs timestep and 10 steps of steepest descent.
     """
     # Set the positions
     _state = mmtools.states.ThermodynamicState(system=system, temperature=300*unit.kelvin)

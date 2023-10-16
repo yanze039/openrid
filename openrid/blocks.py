@@ -212,7 +212,7 @@ class ConcurrentExploration(object):
                                                     totalSteps=nsteps, step=True, time=True,temperature=True,density=True,remainingTime=True,))
             simulation.reporters.append(app.CheckpointReporter(ckp_reporter_name, self.chk_interval))
         
-        debug = True
+        debug = False
         if debug:
             print(conformer_idx)
             print(str(self.confs_list[conformer_idx]))
@@ -228,11 +228,9 @@ class ConcurrentExploration(object):
         logger.info(f" >>> Done. {simulation.currentStep} steps have been propagated.")
         finalState = simulation.context.getState(getPositions=True)
         pmd_topology = pmd.openmm.load_topology(topology.topology, xyz=finalState.getPositions())
-        print(finalState.getPositions())
         out_conf = str(self.output_dir / f"conf_{conformer_idx}.gro")
         pmd_topology.save(out_conf, overwrite=True)
         logger.info(f" >>> Saved to file {out_conf}")
-
         CV_values = self.clac_dihedral_angles(traj_reporter_name, self.cv_def, top=str(self.confs_list[conformer_idx]))
         np.savetxt(CV_file_name, CV_values)
         logger.info(f"Collective variable values saved to {CV_file_name}.")

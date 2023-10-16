@@ -389,6 +389,7 @@ class ReinforcedDynamics:
         
     def run(self):
         start = self.cycle_index
+        logger.info("Total cycles is {}".format(self.n_cycles))
         for cycle in range(start, self.n_cycles):
             self.cycle_index = cycle
             logger.info(f" >>> Starting cycle {cycle}")
