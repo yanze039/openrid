@@ -2,6 +2,9 @@ from openmmtools.constants import *
 import openmm as mm
 
 
+EV_TO_KJ_PER_MOL = 96.485
+
+
 Force_Group_Index = {
         mm.HarmonicBondForce:     0,
         mm.HarmonicAngleForce:    0,

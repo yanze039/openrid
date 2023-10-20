@@ -1,3 +1,4 @@
+import os
 import logging
 import math
 import shutil
@@ -12,10 +13,8 @@ from openrid.colvar import calculate_dihedral_and_derivatives
 
 logger = logging.getLogger(__name__)
 
-
-class DataManager(object):
-    def __init__(self) -> None:
-        pass
+EV_TO_KJ_PER_MOL = 96.485
+KJ_PER_MOL_TO_EV = 1/EV_TO_KJ_PER_MOL
 
 
 class BaseDataset(Dataset):
@@ -54,6 +53,12 @@ class MultiModelDataset(Dataset):
         return sample
 
 
+def l2_loss(f_0, f_hat):
+    f_diff = f_0 - f_hat
+    loss = torch.mean(torch.sum(f_diff**2, dim=-1), dim=-1)
+    return loss
+
+
 class NeuralNetworkManager:
 
     def __init__(
@@ -71,7 +76,7 @@ class NeuralNetworkManager:
             loss_fn = nn.MSELoss(),
             cv_num = 18,
             training_data_portion = 0.9,
-            print_interval = 10
+            print_interval = 100
     ) -> None:
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         if model is None:
@@ -81,6 +86,7 @@ class NeuralNetworkManager:
             self.model = model.to(self.device)
             # self.model.apply(self.init_weights)
         self.data_path = data_path
+        logger.info(f"Using data {str(self.data_path)}")
         if output_dir is None:
             self.output_dir = Path("output")
         else:
@@ -94,10 +100,11 @@ class NeuralNetworkManager:
         self.epochs = epochs
         self.cv_num = cv_num
         self.training_data_portion = training_data_portion
-        self.optimizer = optimizer(self.model.parameters(), lr=self.learning_rate)
         assert self.training_data_portion <= 1.0
         self.loss_fn = loss_fn
         self.print_interval = print_interval
+        self.n_models = self.model.n_models
+        self.optimizer = optimizer
     
     def get_dataset(self):
         if hasattr(self, 'dataset') and hasattr(self, 'validation_dataset'):
@@ -120,7 +127,7 @@ class NeuralNetworkManager:
             n_train = n_data - 1
         all_data = np.random.permutation(all_data)
         train_data = all_data[:n_train]
-        self.training_dataset = MultiModelDataset(train_data)
+        self.training_dataset = MultiModelDataset(train_data, n_models=self.n_models)
         if self.training_data_portion == 1.0:
             self.validation_dataset = None
         else:
@@ -158,12 +165,13 @@ class NeuralNetworkManager:
 
     def script(self, output_path):
         torch.jit.script(self.model).save(output_path)
-
+    
     def train(
         self,
     ): 
-        self.scheduler = torch.optim.lr_scheduler.ExponentialLR(
-            optimizer=self.optimizer, gamma=self.decayRate
+        optimizer = self.optimizer(self.model.parameters(), lr=self.learning_rate)
+        scheduler = torch.optim.lr_scheduler.ExponentialLR(
+            optimizer=optimizer, gamma=self.decayRate
         )
         train_error_list = []
         val_error_list = []
@@ -176,30 +184,28 @@ class NeuralNetworkManager:
             loss_accum = 0
             self.model.train()
             for batch, data in enumerate(self.dataloader["training"]):
-                self.optimizer.zero_grad()
+                optimizer.zero_grad()
 
                 X = data.to(self.device)[...,:self.cv_num].requires_grad_(True).transpose(0,1)
-                y = data.to(self.device)[...,self.cv_num:].transpose(0,1)
+                y = data.to(self.device)[...,self.cv_num:].transpose(0,1) * KJ_PER_MOL_TO_EV
                 mean_forces = self.model.train_mean_force_from_torsion(X)
-                force_loss = self.loss_fn(mean_forces, y)
-
-                force_loss = force_loss.mean()
+                force_loss = l2_loss(mean_forces, y).mean()
                 force_loss.backward()
-                self.optimizer.step()
-                
+                optimizer.step()
                 loss_accum += force_loss.detach().cpu().item()
 
             train_error_list.append(loss_accum/(batch+1))
             if epoch % self.decayStep == 0 and epoch > 0:
-                self.scheduler.step()
+                scheduler.step()
 
             if self.validation_dataloader is not None:
                 self.model.eval()
                 for batch, data in enumerate(self.dataloader["validation"]):
                     X = data.to(self.device)[...,:self.cv_num].requires_grad_(True).reshape(1, -1, self.cv_num)
-                    y = data.to(self.device)[...,self.cv_num:]
+                    y = data.to(self.device)[...,self.cv_num:] * KJ_PER_MOL_TO_EV
                     mean_forces = self.model.validation_mean_force_from_torsion(X).mean(0)
-                    force_loss_validation = self.loss_fn(mean_forces, y)
+                    # force_loss_validation = self.loss_fn(mean_forces, y)
+                    force_loss_validation = l2_loss(mean_forces, y)
             assert force_loss_validation is not None
             val_error_list.append(force_loss_validation.detach().cpu().item())
             if force_loss_validation < miminum_validation_error:
@@ -307,14 +313,8 @@ class DihedralBiasVmap(nn.Module):
         self.colvar_idx = torch.from_numpy(colvar_idx)
         self.n_models = n_models
         self.n_cvs = n_cvs
-
-        self.layer_norm = nn.LayerNorm(2*n_cvs)
-        # self.activation = nn.ReLU()
         self.activation = nn.Tanh()
-        # self.activation = nn.GELU()
-
         self.dropout = nn.Dropout(p=dropout_rate)
-        # model_list = []
 
         self.Sequence = nn.Sequential(
             MultiLinearLayer( n_models, 2 * n_cvs, features[0]),
@@ -339,7 +339,7 @@ class DihedralBiasVmap(nn.Module):
         self.loss_fn = nn.MSELoss()
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.colvar_idx = self.colvar_idx.to(self.device)
-        self.boos_factor = 1.5
+        self.boost_factor = 1.0 * EV_TO_KJ_PER_MOL
     
     def get_e0(self):
         return self.e0
@@ -359,10 +359,10 @@ class DihedralBiasVmap(nn.Module):
         self.to(device)
         self.colvar_idx = self.colvar_idx.to(device)
 
-    def get_model_div(self, torsion):
-        _, force_list = self.get_energy_mean_force_from_torsion(torsion)
-        model_div = torch.mean(torch.var(force_list, dim=-1)) ** 0.5
-        return model_div
+    # def get_model_div(self, torsion):
+    #     _, force_list = self.get_energy_mean_force_from_torsion(torsion)
+    #     model_div = torch.mean(torch.var(force_list, dim=-1)) ** 0.5
+    #     return model_div
 
     def uncertainty_weight(self, model_div):
         iswitch = (self.e1-model_div)/self.e1_m_e0
@@ -371,13 +371,14 @@ class DihedralBiasVmap(nn.Module):
         return uncertainty_weight
 
     def get_energy_from_torsion(self, torsion):
+        # unit # [eV]
         torsion = torch.cat([torch.cos(torsion), torch.sin(torsion)], dim=-1)
         return self.Sequence(torsion).squeeze(-1)
 
-    def get_energy_mean_force_from_torsion(self, torsion):
-        model_energy = self.get_energy_from_torsion(torsion)
-        model_forces = self.get_mean_force_from_torsion(torsion)
-        return model_energy, model_forces
+    # def get_energy_mean_force_from_torsion(self, torsion):
+    #     model_energy = self.get_energy_from_torsion(torsion)
+    #     model_forces = self.get_mean_force_from_torsion(torsion)
+    #     return model_energy, model_forces
 
     # def forward(self, positions, boxvectors):
     def forward(self, positions):
@@ -399,7 +400,7 @@ class DihedralBiasVmap(nn.Module):
         selected_positions = positions[self.colvar_idx.flatten()].reshape([-1, 4, 3])  # [N_CVs, 4, 3]
         cvs, dcvs_dx = calculate_dihedral_and_derivatives(selected_positions)  # [*, 4, 3]
         cvs = cvs.reshape([1, 1, -1])
-        energy = self.get_energy_from_torsion(cvs)  # [4, *]
+        energy = self.get_energy_from_torsion(cvs) * self.boost_factor # [4, *]
         force_list = []
         for imodel in range(self.n_models):
             # add `-` to `energy`?
@@ -414,7 +415,7 @@ class DihedralBiasVmap(nn.Module):
         forces = torch.zeros_like(positions, device=mean_forces.device).index_add_(
             0, self.colvar_idx.flatten(), (mean_forces.reshape(-1, 1, 1) * dcvs_dx.reshape(-1, 4, 3)).reshape(-1, 3)
         )
-        return (energy.mean() * sigma * self.boos_factor, forces * sigma * self.boos_factor)
+        return (energy.mean() * sigma, forces * sigma)
     
     def get_mean_force_from_torsion(self, torsion):
         torsion = torsion.reshape([1, -1, self.n_cvs]).requires_grad_(True)
