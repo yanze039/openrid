@@ -270,7 +270,8 @@ class RestrainedMDSampler(object):
         simulation = app.Simulation(topology.topology, system, integrator, self.platform)
         simulation.context.setPositions(coordinate_odj.positions)
         simulation.context.setVelocitiesToTemperature(self.temperature)
-        simulation.reporters.append(pmd.openmm.NetCDFReporter(traj_out, self.traj_interval, crds=True))
+        # simulation.reporters.append(pmd.openmm.NetCDFReporter(traj_out, self.traj_interval, crds=True))
+        simulation.reporters.append(app.DCDReporter(traj_out, self.traj_interval))
         logger.info(f"Propagate system for {self.n_steps} steps ...")
         simulation.minimizeEnergy()
         simulation.step(self.n_steps)
@@ -292,7 +293,7 @@ class RestrainedMDSampler(object):
     @property
     def name_universe(self):
         return {
-            "traj_out": "{simulation_tag}.res.nc",
+            "traj_out": "{simulation_tag}.res.dcd",
             "info_out": "{simulation_tag}.info.txt",
             "CV_out": "{simulation_tag}.CV.txt",
         }

@@ -9,7 +9,7 @@ import numpy as np
 import parmed as pmd
 import sklearn.cluster as skcluster
 import mdtraj as md
-from openrid.constants import Force_Group_Index
+from openrid.constants import Force_Group_Index, EV_TO_KJ_PER_MOL
 from openrid.Propagator import MTSLangevinDynamicsMove
 from openrid.Sampler import ParallelTemperingSampler, RestrainedMDSampler
 from openrid.colvar import calc_diherals
@@ -207,7 +207,11 @@ class ConcurrentExploration(object):
                 logger.warning("Minimization failed, raise an error.")
             simulation.context.setVelocitiesToTemperature(self.temperatures[conformer_idx])
         if len(simulation.reporters) == 0:
-            simulation.reporters.append(pmd.openmm.NetCDFReporter(traj_reporter_name, self.traj_interval, crds=True))
+            # simulation.reporters.append(pmd.openmm.NetCDFReporter(traj_reporter_name, self.traj_interval, crds=True))
+            if found_chp:
+                simulation.reporters.append(app.DCDReporter(traj_reporter_name, self.traj_interval, append=True))
+            else:
+                simulation.reporters.append(app.DCDReporter(traj_reporter_name, self.traj_interval, append=False))
             simulation.reporters.append(app.StateDataReporter(state_reporter_name, self.info_interval, 
                                                     totalSteps=nsteps, step=True, time=True,temperature=True,density=True,remainingTime=True,))
             simulation.reporters.append(app.CheckpointReporter(ckp_reporter_name, self.chk_interval))
@@ -530,10 +534,12 @@ class Selector(object):
             raise TypeError("data should be str or list of str")
 
     def select_by_model(self, torsion):
+        print(torsion)
         assert self.model is not None, "model must be specified"
         self.model.eval()
         # mean forces: [n_model, 1, n_frames, n_cv]
-        mean_forces = self.model.get_mean_force_from_torsion(torsion.to(self.model.device)).detach().cpu()
+        mean_forces = self.model.get_mean_force_from_torsion(torsion.to(self.model.device)) * EV_TO_KJ_PER_MOL
+        mean_forces = mean_forces.detach().cpu()
         model_devi = (torch.mean( torch.var(mean_forces, dim=0), dim=-1 ) ** 0.5).flatten()
         selected_idx = torch.where(model_devi > self.model_devi_threshold )[0]
         return selected_idx

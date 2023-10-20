@@ -42,7 +42,7 @@ class ReinforcedDynamicsLoop:
             timestep_nn = 4.0*unit.femtosecond,
             collision_rate = 1.0/unit.picoseconds,
             reporter = mmtools.multistate.MultiStateReporter, 
-            reporter_name = "reporter.nc", 
+            reporter_name = "reporter.dcd", 
             reporter_checkpoint_interval_exploration = 2,
             n_remd_iters=800,
             n_steps_per_iter=500, 
@@ -62,6 +62,7 @@ class ReinforcedDynamicsLoop:
             epochs=100,
             model_features=[80,80,80,80],
             batch_size=128,
+            dropout_rate=0.0,
             loop_output_dir=Path("loop"),
             resume=True,
             prior_data=None,
@@ -123,6 +124,7 @@ class ReinforcedDynamicsLoop:
         self.model_features = model_features
         self.batch_size = batch_size
         self.epochs = epochs
+        self.dropout_rate = dropout_rate
 
         self.loop_output_dir = Path(loop_output_dir)
         self.exploration_dir = self.loop_output_dir / "exploration"
@@ -310,10 +312,17 @@ class ReinforcedDynamicsLoop:
             colvar_idx=self.cv_def, 
             n_models=self.n_model, 
             n_cvs=len(self.cv_def), 
-            dropout_rate=0.1,
+            dropout_rate=self.dropout_rate,
             features=self.model_features,
             e0=self.init_trust_lvl_1,
             e1=self.init_trust_lvl_2
+        )
+        logger.info(
+            f"cv_def: {self.cv_def} \n" \
+            f"n_model: {self.n_model} \n" \
+            f"n_cv: {len(self.cv_def)}\n" \
+            f"dropout_rate: {self.dropout_rate}\n" \
+            f"features: {self.model_features}\n" \
         )
         training_step = NeuralNetworkManager(
             model = self.model_new,
@@ -362,7 +371,7 @@ class ReinforcedDynamics:
         self.n_cycles = self.config["option"]["num_rid_cycles"]
         self.output_dir = Path(self.config["option"]["output_dir"])
         self.task_name = self.config["option"]["task_name"]
-        self.storage_name = f"{self.task_name}.reporter.nc"
+        self.storage_name = f"{self.task_name}.reporter.dcd"
         self.log_path = self.output_dir / f"{self.task_name}.log"
         if not os.path.exists(self.output_dir):
             os.makedirs(self.output_dir, exist_ok=True)
@@ -457,6 +466,7 @@ class ReinforcedDynamics:
                 epochs=self.config["Train"]["epochs"],
                 model_features=self.config["Train"]["neurons"],
                 batch_size=self.config["Train"]["batch_size"],
+                dropout_rate=self.config["Train"]["dropout_rate"],
                 loop_output_dir=loop_output_dir,
                 resume=self.resume,
                 prior_data=prior_data
