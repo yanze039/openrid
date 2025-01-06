@@ -2,6 +2,7 @@ import os
 import logging
 import math
 import shutil
+from typing import Tuple, Optional, List
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
@@ -9,6 +10,7 @@ from pathlib import Path
 import numpy as np
 from openrid.colvar import DihedralAngle
 from openrid.colvar import calculate_dihedral_and_derivatives
+from abc import ABC, abstractmethod
 
 
 logger = logging.getLogger(__name__)
@@ -294,19 +296,6 @@ class DihedralBiasVmap(nn.Module):
             e0=2.,
             e1=3.
         ):
-        """Initialize the biasing potential.
-
-            Parameters
-            ----------
-            colvar : torch.nn.Module
-                  The collective variable to bias.
-            kT : float
-                  The temperature in units of energy.
-            target : float
-                  The target value of the collective variable.
-            width : float
-                  The width of the biasing potential.
-        """
         super().__init__()
         if isinstance(colvar_idx, list):
             colvar_idx = np.array(colvar_idx)
@@ -359,11 +348,6 @@ class DihedralBiasVmap(nn.Module):
         self.to(device)
         self.colvar_idx = self.colvar_idx.to(device)
 
-    # def get_model_div(self, torsion):
-    #     _, force_list = self.get_energy_mean_force_from_torsion(torsion)
-    #     model_div = torch.mean(torch.var(force_list, dim=-1)) ** 0.5
-    #     return model_div
-
     def uncertainty_weight(self, model_div):
         iswitch = (self.e1-model_div)/self.e1_m_e0
         # use heaviside function to make the gradient zero when iswitch is zero
@@ -374,11 +358,6 @@ class DihedralBiasVmap(nn.Module):
         # unit # [eV]
         torsion = torch.cat([torch.cos(torsion), torch.sin(torsion)], dim=-1)
         return self.Sequence(torsion).squeeze(-1)
-
-    # def get_energy_mean_force_from_torsion(self, torsion):
-    #     model_energy = self.get_energy_from_torsion(torsion)
-    #     model_forces = self.get_mean_force_from_torsion(torsion)
-    #     return model_energy, model_forces
 
     # def forward(self, positions, boxvectors):
     def forward(self, positions):
@@ -395,8 +374,6 @@ class DihedralBiasVmap(nn.Module):
             The potential energy (in kJ/mol)
         """
         positions.requires_grad_(True)
-        # boxsize = boxvectors.diag()
-        # positions = positions - torch.floor(positions/boxsize)*boxsize  # remove PBC
         selected_positions = positions[self.colvar_idx.flatten()].reshape([-1, 4, 3])  # [N_CVs, 4, 3]
         cvs, dcvs_dx = calculate_dihedral_and_derivatives(selected_positions)  # [*, 4, 3]
         cvs = cvs.reshape([1, 1, -1])
@@ -452,277 +429,175 @@ class DihedralBiasVmap(nn.Module):
             force_list.append(mean_forces.squeeze(0))
         mean_forces = torch.stack(force_list, dim=0)
         return mean_forces
+
+
+class BiasForceNet(nn.Module):
+    """Free energy biasing potential."""
+
+    def __init__(self, model, CVFn, CVIndex, e0=2., e1=3., bias_factor=1.0):
+        super().__init__()
+        self.e0 = e0
+        self.e1 = e1
+        # just calculate once
+        self.e1_m_e0 = e1-e0
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        if isinstance(CVIndex, list):
+            CVIndex = np.array(CVIndex)
+        self.colvar_idx = torch.from_numpy(CVIndex)
+        self.colvar_idx = self.colvar_idx.to(self.device)
+        self.model = model
+        self.CVFn = CVFn
+        self.n_models = model.n_models
+        self.bias_factor = bias_factor * EV_TO_KJ_PER_MOL
     
-    def get_auto_grad_forces_from_torsion(self, torsion):
-        energy = self.get_energy_from_torsion(torsion)
-        energy_ave = torch.mean(energy)
-        forces = torch.autograd.grad([-energy_ave,], [torsion,], allow_unused=True, create_graph=True, retain_graph=True)[0]
-        return forces
+    def get_uncertainty_threshold(self):
+        return [self.e0, self.e1]
+
+    def set_uncertainty_threshold(self, e0, e1):
+        self.e0 = e0
+        self.e1 = e1
+        self.e1_m_e0 = e1 - e0
+
+    def forward(self, positions):
+        """The forward method returns the energy computed from positions.
+
+            Parameters
+            ----------
+            positions : torch.Tensor with shape (nparticles, 3)
+            positions[i,k] is the position (in nanometers) of spatial dimension k of particle i
+
+            Returns
+            -------
+            potential : torch.Scalar
+            The potential energy (in kJ/mol)
+        """
+        positions.requires_grad_(True)
+        selected_positions = positions[self.colvar_idx.flatten()].reshape([-1, 4, 3])  # [N_CVs, 4, 3]
+        cvs, dcvs_dx = self.CVFn(selected_positions)
+        cvs = cvs.reshape([1, 1, -1])
+        energy = self.model.get_energy_from_CV(cvs) * self.bias_factor
+        force_list = []
+        for imodel in range(self.n_models):
+            bias_forces = torch.autograd.grad([  energy[imodel],], [cvs,], retain_graph=True)[0]
+            assert bias_forces is not None
+            force_list.append( bias_forces)
+        bias_forces = torch.stack(force_list, dim=0)
+        model_div = torch.mean(torch.var(bias_forces, dim=0)) ** 0.5
+        sigma = self.uncertainty_weight(model_div)
+        bias_forces = bias_forces.mean(0)
+        forces = torch.zeros_like(positions, device=bias_forces.device).index_add_(
+            0, self.colvar_idx.flatten(), (bias_forces.reshape(-1, 1, 1) * dcvs_dx.reshape(-1, 4, 3)).reshape(-1, 3)
+        )
+        return (energy.mean() * sigma, forces * sigma)
+    
+    def uncertainty_weight(self, model_div):
+        iswitch = (self.e1-model_div)/self.e1_m_e0
+        # use heaviside function to make the gradient zero when iswitch is zero
+        uncertainty_weight = torch.heaviside(torch.div(iswitch, 1, rounding_mode='floor'), 0.5*(1+torch.cos(torch.pi*(1-iswitch))))
+        return uncertainty_weight
 
 
-# class DihedralBias(nn.Module):
-#     """Free energy biasing potential."""
-
-#     def __init__(
-#             self, 
-#             colvar_fn, 
-#             colvar_idx, 
-#             n_models, 
-#             n_cvs, 
-#             dropout_rate=0.1,
-#             features=[64, 64, 64, 64],
-#             e0=2,
-#             e1=3
-#         ):
-#         """Initialize the biasing potential.
-
-#             Parameters
-#             ----------
-#             colvar : torch.nn.Module
-#                   The collective variable to bias.
-#             kT : float
-#                   The temperature in units of energy.
-#             target : float
-#                   The target value of the collective variable.
-#             width : float
-#                   The width of the biasing potential.
-#         """
-#         super().__init__()
-#         self.colvar_fn = colvar_fn()
-#         self.colvar_idx = torch.from_numpy(colvar_idx)
-#         self.n_models = n_models
-#         self.n_cvs = n_cvs
-
-#         self.layer_norm = nn.LayerNorm(2*n_cvs)
-
-#         self.model1 = MLP(2 * n_cvs, 1, dropout_rate=dropout_rate, features=features)
-#         self.model2 = MLP(2 * n_cvs, 1, dropout_rate=dropout_rate, features=features)
-#         self.model3 = MLP(2 * n_cvs, 1, dropout_rate=dropout_rate, features=features)
-#         self.model4 = MLP(2 * n_cvs, 1, dropout_rate=dropout_rate, features=features)
-#         self.model_list = [self.model1, self.model2, self.model3, self.model4]
-#         self.e0 = e0
-#         self.e1 = e1
-#         # just calculate once
-#         self.e1_m_e0 = e1-e0
-#         self.loss_fn = nn.MSELoss()
-            
-
-#     def forward(self, positions, boxvectors):
-#         """The forward method returns the energy computed from positions.
-
-#             Parameters
-#             ----------
-#             positions : torch.Tensor with shape (nparticles, 3)
-#             positions[i,k] is the position (in nanometers) of spatial dimension k of particle i
-
-#             Returns
-#             -------
-#             potential : torch.Scalar
-#             The potential energy (in kJ/mol)
-#         """
-#         positions.requires_grad_(True)
-#         boxsize = boxvectors.diag()
-#         positions = positions - torch.floor(positions/boxsize)*boxsize  # remove PBC
-#         selected_positions = positions[self.colvar_idx.flatten()].reshape([-1, 4, 3])  # [N_CVs, 4, 3]
-#         # calculate CVs
-#         cvs = self.colvar_fn(selected_positions)
-#         energy, mean_sforces = self.get_energy_mean_force_from_torsion(cvs)
+class AbstractCVNet(nn.Module, ABC):
+    def __init__(
+            self, 
+            n_models, 
+            n_cvs, 
+            dropout_rate=0.1,
+            features=[64, 64, 64, 64]
+        ):
+        super().__init__()
+        self.n_models = n_models
+        self.n_cvs = n_cvs
+        self.activation = nn.Tanh()
+        self.dropout = nn.Dropout(p=dropout_rate)
+        self.hiddens = nn.ModuleList()
+        self.input_layer = MultiLinearLayer( n_models, 2 * n_cvs, features[0])
+        for ii in range(len(features)-1):
+            self.hiddens.append(MultiLinearLayer(n_models, features[ii], features[ii+1]))
+        self.final_layer = MultiLinearLayer(n_models, features[-1], 1)
         
-#         energy_ave = torch.mean(energy)
-#         forces = -torch.autograd.grad([energy_ave,], [positions,], allow_unused=True, create_graph=True, retain_graph=True)[0]
-#         assert forces is not None
-#         model_div = torch.mean(torch.var(mean_sforces, dim=-1)) ** 0.5
-#         sigma = self.uncertainty_weight(model_div)
-
-#         return (energy_ave * sigma, forces * sigma)
+    def forward(self, cvs) -> Tuple[torch.Tensor, torch.Tensor]:
+        energy = self.get_energy_from_CV(cvs) # [4, *]
+        force_list = []
+        for imodel in range(self.n_models):
+            # add `-` to `energy`?
+            # mean_forces = torch.autograd.grad([ - energy[imodel],], [cvs,], retain_graph=True)[0]
+            mean_forces = torch.autograd.grad([  energy[imodel],], [cvs,], retain_graph=True)[0]
+            assert mean_forces is not None
+            force_list.append( mean_forces)
+        mean_forces = torch.stack(force_list, dim=0)
+        return energy, mean_forces
     
-#     def get_model_div(self, torsion):
-#         _, force_list = self.get_energy_mean_force_from_torsion(torsion)
-#         model_div = torch.mean(torch.var(force_list, dim=-1)) ** 0.5
-#         return model_div
-
-#     def uncertainty_weight(self, model_div):
-#         iswitch = (self.e1-model_div)/self.e1_m_e0
-#         # use heaviside function to make the gradient zero when iswitch is zero
-#         uncertainty_weight = torch.heaviside(torch.div(iswitch, 1, rounding_mode='floor'), 0.5*(1+torch.cos(torch.pi*(1-iswitch))))
-#         return uncertainty_weight
-
+    def train_mean_force(self, cvs):
+        cvs = cvs.reshape([self.n_models, -1, self.n_cvs]).requires_grad_(True)
+        energy = self.get_energy_from_CV(cvs)
+        force_list = []
+        for imodel in range(self.n_models):
+            mean_forces = torch.autograd.grad([(-energy[imodel]),], [cvs,], grad_outputs=[torch.ones_like(energy[imodel]),], create_graph=True, retain_graph=True)[0]
+            assert mean_forces is not None
+            force_list.append(mean_forces[imodel])
+        mean_forces = torch.stack(force_list, dim=0)
+        return mean_forces
     
-#     def get_energy_from_torsion(self, torsion):
-#         torsion = torch.cat([torch.cos(torsion), torch.sin(torsion)], dim=-1)
-#         # torsion = self.layer_norm(torsion).reshape([-1, 2*self.n_cvs])
-#         torsion = torsion.reshape([-1, 2*self.n_cvs])
-#         # energy_list = torch.zeros(torsion.shape[0], self.n_models)
-#         # energy_list = []
-#         # for i, model in enumerate(self.model_list):
-#         #     energy = model(torsion).reshape(-1)
-#         #     # energy_list[:,i] = energy
-#         #     energy_list.append( energy )
-#         return torch.stack([
-#                 self.model1(torsion).reshape(-1),
-#                 self.model2(torsion).reshape(-1),
-#                 self.model3(torsion).reshape(-1),
-#                 self.model4(torsion).reshape(-1)
-#             ], dim=-1)
-#         # return torch.stack(energy_list, dim=-1)
-    
+    def validation_mean_force(self, cvs):
+        cvs = cvs.reshape([1, -1, self.n_cvs])
+        energy = self.get_energy_from_CV(cvs)
+        force_list = []
+        for imodel in range(self.n_models):
+            mean_forces = torch.autograd.grad([(-energy[imodel]),], [cvs,], grad_outputs=[torch.ones_like(energy[imodel]),], create_graph=True, retain_graph=True)[0]
+            assert mean_forces is not None
+            force_list.append(mean_forces.squeeze(0))
+        mean_forces = torch.stack(force_list, dim=0)
+        return mean_forces
 
-#     def get_energy_mean_force_from_torsion(self, torsion):
-#         model_energy = self.get_energy_from_torsion(torsion)
-#         force_list = []
-#         grad_outputs : List[Optional[torch.Tensor]] = [ torch.ones_like(model_energy[:,0]) ]
-#         for imodel in range(self.n_models):
-#             mean_forces = -torch.autograd.grad([model_energy[:,imodel],], [torsion,], grad_outputs=grad_outputs, retain_graph=True )[0]
-#             assert mean_forces is not None
-#             force_list.append(mean_forces)
-#         force_list = torch.stack(force_list, dim=-1)
-#         return model_energy, force_list
-    
-
-#     def mseloss(self, torsion):
-#         energy_list = self.get_energy_from_torsion(torsion)
-#         force_list = torch.zeros(energy_list.shape[0], self.n_models, self.n_cvs)
-#         for imodel in range(self.n_models):
-#             mean_forces = -torch.autograd.grad(energy_list[:,imodel], torsion, retain_graph=True )[0]
-#             force_list[imodel] = mean_forces
-#         return energy_list, force_list
+    @abstractmethod
+    def get_energy_from_CV(self, cvs) -> torch.Tensor:
+        pass        
 
 
-# class DihedralBiasVMapDeprecated(nn.Module):
-#     """Free energy biasing potential."""
+class DistanceCVNet(AbstractCVNet):
+    def __init__(
+            self, 
+            n_models, 
+            n_cvs, 
+            dropout_rate=0.1,
+            features=[64, 64, 64, 64]
+        ):
+        super().__init__(n_models, n_cvs, dropout_rate, features)
 
-#     def __init__(
-#             self, 
-#             colvar_fn, 
-#             colvar_idx, 
-#             n_models, 
-#             n_cvs, 
-#             dropout_rate=0.1,
-#             features=[64, 64, 64, 64],
-#             e0=2,
-#             e1=3
-#         ):
-#         """Initialize the biasing potential.
+    def get_energy_from_CV(self, cvs):
+        # unit # [eV]
+        cvs = self.activation(self.input_layer(cvs))
+        cvs = self.dropout(cvs)
+        for layer in self.hiddens:
+            cvs = self.activation(layer(cvs)) + cvs
+            cvs = self.dropout(cvs)
+        output = self.final_layer(cvs).squeeze(-1)
+        return output
 
-#             Parameters
-#             ----------
-#             colvar : torch.nn.Module
-#                   The collective variable to bias.
-#             kT : float
-#                   The temperature in units of energy.
-#             target : float
-#                   The target value of the collective variable.
-#             width : float
-#                   The width of the biasing potential.
-#         """
-#         super().__init__()
-#         self.colvar_fn = colvar_fn()
-#         self.colvar_idx = torch.from_numpy(colvar_idx)
-#         self.n_models = n_models
-#         self.n_cvs = n_cvs
 
-#         self.layer_norm = nn.LayerNorm(2*n_cvs)
+class PeriodicCVNet(AbstractCVNet):
+    def __init__(
+            self, 
+            n_models, 
+            n_cvs, 
+            dropout_rate=0.1,
+            features=[64, 64, 64, 64]
+        ):
+        super().__init__(n_models, n_cvs, dropout_rate, features)
 
-#         self.model1 = MLP(2 * n_cvs, 1, dropout_rate=dropout_rate, features=features)
-#         self.model2 = MLP(2 * n_cvs, 1, dropout_rate=dropout_rate, features=features)
-#         self.model3 = MLP(2 * n_cvs, 1, dropout_rate=dropout_rate, features=features)
-#         self.model4 = MLP(2 * n_cvs, 1, dropout_rate=dropout_rate, features=features)
-#         self.model_list = [self.model1, self.model2, self.model3, self.model4]
-#         self.fmodel, self.params, self.buffers = combine_state_for_ensemble(self.model_list)
-#         [p.requires_grad_() for p in self.params]
-#         self.predictions_vmap = torch.vmap(self.fmodel, in_dims=(0,0,None))
-#         self.e0 = e0
-#         self.e1 = e1
-#         # just calculate once
-#         self.e1_m_e0 = e1-e0
-#         self.loss_fn = nn.MSELoss()
-            
-#     def get_model_div(self, torsion):
-#         _, force_list = self.get_energy_mean_force_from_torsion(torsion)
-#         model_div = torch.mean(torch.var(force_list, dim=-1)) ** 0.5
-#         return model_div
-
-#     def uncertainty_weight(self, model_div):
-#         iswitch = (self.e1-model_div)/self.e1_m_e0
-#         # use heaviside function to make the gradient zero when iswitch is zero
-#         uncertainty_weight = torch.heaviside(torch.div(iswitch, 1, rounding_mode='floor'), 0.5*(1+torch.cos(torch.pi*(1-iswitch))))
-#         return uncertainty_weight
-
-    
-#     def get_energy_from_torsion_vmap(self, torsion):
-#         torsion = torch.cat([torch.cos(torsion), torch.sin(torsion)], dim=-1)
-#         # torsion = self.layer_norm(torsion).reshape([-1, 2*self.n_cvs])
-#         torsion = torsion.reshape([-1, 2*self.n_cvs])
-#         return self.predictions_vmap(self.params, self.buffers, torsion)
-    
-#     def get_energy_from_torsion(self, torsion):
-#         torsion = torch.cat([torch.cos(torsion), torch.sin(torsion)], dim=-1)
-#         # torsion = self.layer_norm(torsion).reshape([-1, 2*self.n_cvs])
-#         torsion = torsion.reshape([-1, 2*self.n_cvs])
-#         # energy_list = torch.zeros(torsion.shape[0], self.n_models)
-#         # energy_list = []
-#         # for i, model in enumerate(self.model_list):
-#         #     energy = model(torsion).reshape(-1)
-#         #     # energy_list[:,i] = energy
-#         #     energy_list.append( energy )
-#         return torch.stack([
-#                 self.model1(torsion).reshape(-1),
-#                 self.model2(torsion).reshape(-1),
-#                 self.model3(torsion).reshape(-1),
-#                 self.model4(torsion).reshape(-1)
-#             ], dim=-1)
-#         # return torch.stack(energy_list, dim=-1)
+    def get_energy_from_CV(self, cvs):
+        # unit # [eV]
+        cvs = torch.cat([torch.cos(cvs), torch.sin(cvs)], dim=-1)
+        cvs = self.activation(self.input_layer(cvs))
+        cvs = self.dropout(cvs)
+        for layer in self.hiddens:
+            cvs = self.activation(layer(cvs)) + cvs
+            cvs = self.dropout(cvs)
+        output = self.final_layer(cvs).squeeze(-1)
+        return output
     
 
-#     def get_energy_mean_force_from_torsion(self, torsion):
-#         model_energy = self.get_energy_from_torsion(torsion)
-#         force_list = []
-#         grad_outputs : List[Optional[torch.Tensor]] = [ torch.ones_like(model_energy[:,0]) ]
-#         for imodel in range(self.n_models):
-#             mean_forces = -torch.autograd.grad([model_energy[:,imodel],], [torsion,], grad_outputs=grad_outputs, retain_graph=True )[0]
-#             assert mean_forces is not None
-#             force_list.append(mean_forces)
-#         force_list = torch.stack(force_list, dim=-1)
-#         return model_energy, force_list
-    
-
-#     def mseloss(self, torsion):
-#         energy_list = self.get_energy_from_torsion(torsion)
-#         force_list = torch.zeros(energy_list.shape[0], self.n_models, self.n_cvs)
-#         for imodel in range(self.n_models):
-#             mean_forces = -torch.autograd.grad(energy_list[:,imodel], torsion, retain_graph=True )[0]
-#             force_list[imodel] = mean_forces
-#         return energy_list, force_list
-
-           
-
-#     def forward(self, positions, boxvectors):
-#         """The forward method returns the energy computed from positions.
-
-#             Parameters
-#             ----------
-#             positions : torch.Tensor with shape (nparticles, 3)
-#             positions[i,k] is the position (in nanometers) of spatial dimension k of particle i
-
-#             Returns
-#             -------
-#             potential : torch.Scalar
-#             The potential energy (in kJ/mol)
-#         """
-#         positions.requires_grad_(True)
-#         boxsize = boxvectors.diag()
-#         positions = positions - torch.floor(positions/boxsize)*boxsize  # remove PBC
-#         selected_positions = positions[self.colvar_idx.flatten()].reshape([-1, 4, 3])  # [N_CVs, 4, 3]
-#         # calculate CVs
-#         cvs = self.colvar_fn(selected_positions)
-#         energy, mean_sforces = self.get_energy_mean_force_from_torsion(cvs)
-#         energy_ave = torch.mean(energy)
-#         forces = -torch.autograd.grad([energy_ave,], [positions,], allow_unused=True, create_graph=True, retain_graph=True)[0]
-#         assert forces is not None
-#         model_div = torch.mean(torch.var(mean_sforces, dim=-1)) ** 0.5
-#         sigma = self.uncertainty_weight(model_div)
-
-#         return (energy_ave * sigma, forces * sigma)
 
 
 if __name__ == "__main__":
